@@ -59,6 +59,12 @@ GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 # Adjust to match the CUDA version your customers' NVIDIA drivers support.
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
 
+# Bump this whenever requirements.txt or the torch/torchvision install line
+# changes. Machines that already ran setup under an older version will
+# automatically redo just the pip-install steps (not the ~100MB Python
+# download) instead of silently keeping stale/missing packages.
+SETUP_VERSION = "2"
+
 DEFAULT_PORT = 8000
 
 
@@ -191,7 +197,7 @@ class LauncherApp(tk.Tk):
 
     def _start_flow(self):
         """Runs off the UI thread: provision the env if needed, then launch."""
-        if not SETUP_MARKER.exists():
+        if not self._setup_is_current():
             self.busy = True
             self.after(0, lambda: self.toggle_btn.configure(text="Setting up…"))
             self.set_status("Setting up (first run only)…", "#e8c44d")
@@ -202,6 +208,12 @@ class LauncherApp(tk.Tk):
                 self.set_status("Setup failed", "#e05a4e")
                 return
         self._launch_server_process()
+
+    def _setup_is_current(self) -> bool:
+        try:
+            return SETUP_MARKER.read_text().strip() == SETUP_VERSION
+        except Exception:
+            return False
 
     # -------------------------------------------------- first-run setup ----
     def _run_step(self, cmd: list[str], cwd: Path | None = None) -> bool:
@@ -275,7 +287,7 @@ class LauncherApp(tk.Tk):
         self.log("Installing PyTorch (CUDA build) — this is the biggest download…")
         if not self._run_step([
             str(python_exe_path()), "-m", "pip", "install",
-            "torch", "--index-url", TORCH_INDEX_URL,
+            "torch", "torchvision", "--index-url", TORCH_INDEX_URL,
         ]):
             return False
 
@@ -286,7 +298,7 @@ class LauncherApp(tk.Tk):
         ]):
             return False
 
-        SETUP_MARKER.write_text("ok")
+        SETUP_MARKER.write_text(SETUP_VERSION)
         self.log("[✓] Environment ready.")
         return True
 
