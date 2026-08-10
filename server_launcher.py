@@ -56,14 +56,17 @@ EMBED_PYTHON_URL = (
     f"python-{PYTHON_VERSION}-embed-amd64.zip"
 )
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
-# Adjust to match the CUDA version your customers' NVIDIA drivers support.
-TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
+# cu128 supports Blackwell (RTX 50-series, sm_120) as well as everything
+# older down through Ampere/Turing. If you ever ship to a fleet of much
+# older cards only, a smaller/older index would also work, but cu128 is the
+# safe default for current-gen NVIDIA hardware.
+TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 
 # Bump this whenever requirements.txt or the torch/torchvision install line
 # changes. Machines that already ran setup under an older version will
 # automatically redo just the pip-install steps (not the ~100MB Python
 # download) instead of silently keeping stale/missing packages.
-SETUP_VERSION = "2"
+SETUP_VERSION = "3"
 
 DEFAULT_PORT = 8000
 
@@ -219,11 +222,14 @@ class LauncherApp(tk.Tk):
     def _run_step(self, cmd: list[str], cwd: Path | None = None) -> bool:
         """Run a subprocess, streaming its output into the log. Returns success."""
         self.log("$ " + " ".join(str(c) for c in cmd))
+        env = os.environ.copy()
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         try:
             proc = subprocess.Popen(
                 cmd, cwd=str(cwd) if cwd else None,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, bufsize=1, encoding="utf-8", errors="replace", env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except Exception as e:
@@ -310,13 +316,15 @@ class LauncherApp(tk.Tk):
 
         env = os.environ.copy()
         env["EZI_OCR_PORT"] = str(self.port)
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
 
         try:
             self.process = subprocess.Popen(
                 [str(python_exe_path()), str(BUNDLED_SERVER_SCRIPT)],
                 cwd=str(BUNDLED_SERVER_SCRIPT.parent),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, env=env,
+                text=True, bufsize=1, encoding="utf-8", errors="replace", env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except Exception as e:
