@@ -3,17 +3,11 @@ name: Build OCR Server Launcher
 on:
   push:
     branches: [main]
-    paths:
-      - "server-launcher/**"
   workflow_dispatch: {}
 
 jobs:
   build-launcher:
     runs-on: windows-latest
-
-    defaults:
-      run:
-        working-directory: server-launcher
 
     steps:
       - name: Checkout
@@ -34,5 +28,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: EZI-OCR-Server-Launcher-Windows
-          path: server-launcher/dist/EZI OCR Server Launcher.exe
+          path: dist/EZI OCR Server Launcher.exe
           if-no-files-found: error
