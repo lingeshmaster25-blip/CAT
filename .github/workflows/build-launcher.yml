@@ -1,0 +1,38 @@
+name: Build OCR Server Launcher
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server-launcher/**"
+  workflow_dispatch: {}
+
+jobs:
+  build-launcher:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        working-directory: server-launcher
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Build with PyInstaller
+        run: pyinstaller --onefile --windowed --name "EZI OCR Server Launcher" server_launcher.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EZI-OCR-Server-Launcher-Windows
+          path: server-launcher/dist/EZI OCR Server Launcher.exe
+          if-no-files-found: error
