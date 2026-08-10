@@ -57,17 +57,20 @@ runner, no local Windows machine needed.
 2. Actions tab → **Build OCR Server Launcher** → Run workflow (or push to
    `main`).
 3. Download the **EZI-OCR-Server-Launcher-Windows** artifact once green —
-   it's a single portable `.exe`. Hand that one file to the customer; the
-   rest happens on their machine the first time they click Start.
+   GitHub zips it automatically. Unzip and hand the customer the whole
+   `EZI OCR Server Launcher` folder; the rest happens on their machine the
+   first time they click Start.
 
 ### Build locally instead
 
 ```bash
 pip install -r requirements-build.txt
-pyinstaller --onefile --windowed --name "EZI OCR Server Launcher" ^
+pyinstaller --onedir --windowed --name "EZI OCR Server Launcher" ^
   --add-data "ocr_server.py;." ^
   --add-data "requirements.txt;." ^
   server_launcher.py
 ```
 
-Output lands in `dist/`.
+Output lands in `dist/EZI OCR Server Launcher/` — it's a folder, not a
+single file (this build faster and starts faster than a one-file exe).
+Hand the customer the whole folder (zipped); they run the `.exe` inside it.
