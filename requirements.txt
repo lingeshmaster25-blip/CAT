@@ -1,0 +1,10 @@
+# Installed into the app's private python_env on first run.
+# torch is installed separately (see server_launcher.py) with the CUDA
+# wheel index, since the plain PyPI build is CPU-only on Windows.
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
+transformers>=4.45
+accelerate
+qwen-vl-utils

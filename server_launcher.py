@@ -1,51 +1,77 @@
 """
 EZI OCR Server Launcher — Trilo Automation
 
-A tiny one-button front end for backend/ocr_server.py. It doesn't run the
-model itself — it launches the same Python environment you already use
-(the one with torch/transformers/etc. already installed and working) as a
-background process, and shows its status/log output in a clean window
-instead of a raw terminal/IDE console.
+Self-contained: the customer never picks a Python interpreter or a script
+file. This app carries ocr_server.py and its dependency list with it.
 
-First run: click the gear icon once to point it at:
-  - Python executable  (the interpreter that already runs ocr_server.py today)
-  - ocr_server.py      (the script itself, inside backend/)
-Both are remembered afterwards in a small config file next to this program.
+First run on a machine:
+  1. Downloads a small, private, portable Python (not the system Python —
+     nothing is installed system-wide, nothing conflicts with anything else
+     on the machine).
+  2. Installs pip into it, then installs torch (CUDA build) + fastapi +
+     transformers + everything ocr_server.py needs. This step needs an
+     internet connection and downloads a few GB — progress is streamed into
+     the Log panel.
+  3. Starts ocr_server.py using that private Python.
+
+Every run after that: the private env already exists, so it skips straight
+to step 3 — the model weights (~4 GB) still download once, automatically,
+the first time the server actually starts, same as step 2.
+
+Everything lives under %LOCALAPPDATA%\\EZI OCR Server\\ so re-installing or
+replacing the launcher .exe doesn't force a re-download.
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
 import threading
-import tkinter as tk
+import urllib.request
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
+import tkinter as tk
 
 APP_TITLE = "EZI OCR Server"
-CONFIG_FILE = Path(sys.argv[0]).resolve().parent / "server_launcher_config.json"
 
-DEFAULT_CONFIG = {
-    "python_path": "",
-    "script_path": "",
-    "port": 8000,
-}
+# ── Where the bundled server script lives ───────────────────────────────────
+# When built with PyInstaller (--add-data "ocr_server.py;."), it's extracted
+# next to this file at runtime under sys._MEIPASS. When run directly as a
+# .py during development, it's just next to this script.
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+BUNDLED_SERVER_SCRIPT = BUNDLE_DIR / "ocr_server.py"
+BUNDLED_REQUIREMENTS = BUNDLE_DIR / "requirements.txt"
+
+# ── Where the private, per-machine runtime lives (NOT inside the bundle —
+# this has to be writable and persist across app updates) ──────────────────
+APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server"
+ENV_DIR = APP_DATA_DIR / "python_env"
+SETUP_MARKER = ENV_DIR / ".setup_complete"
+PORT_CONFIG_FILE = APP_DATA_DIR / "port.json"
+
+PYTHON_VERSION = "3.11.9"
+EMBED_PYTHON_URL = (
+    f"https://www.python.org/ftp/python/{PYTHON_VERSION}/"
+    f"python-{PYTHON_VERSION}-embed-amd64.zip"
+)
+GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+# Adjust to match the CUDA version your customers' NVIDIA drivers support.
+TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu124"
+
+DEFAULT_PORT = 8000
 
 
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text())
-            cfg = dict(DEFAULT_CONFIG)
-            cfg.update(data)
-            return cfg
-        except Exception:
-            pass
-    return dict(DEFAULT_CONFIG)
+def load_port() -> int:
+    try:
+        return json.loads(PORT_CONFIG_FILE.read_text())["port"]
+    except Exception:
+        return DEFAULT_PORT
 
 
-def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+def save_port(port: int) -> None:
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PORT_CONFIG_FILE.write_text(json.dumps({"port": port}))
 
 
 def local_ip() -> str:
@@ -60,72 +86,11 @@ def local_ip() -> str:
         s.close()
 
 
-class SettingsDialog(tk.Toplevel):
-    def __init__(self, parent, cfg: dict, on_save):
-        super().__init__(parent)
-        self.title("Server Settings")
-        self.resizable(False, False)
-        self.cfg = cfg
-        self.on_save = on_save
-        self.transient(parent)
-        self.grab_set()
-
-        pad = {"padx": 12, "pady": 6}
-
-        tk.Label(self, text="Python executable (the one with torch/transformers installed):",
-                 anchor="w").grid(row=0, column=0, columnspan=2, sticky="w", **pad)
-        self.python_var = tk.StringVar(value=cfg["python_path"])
-        tk.Entry(self, textvariable=self.python_var, width=52).grid(row=1, column=0, **pad)
-        tk.Button(self, text="Browse…", command=self.browse_python).grid(row=1, column=1, **pad)
-
-        tk.Label(self, text="ocr_server.py location:", anchor="w").grid(
-            row=2, column=0, columnspan=2, sticky="w", **pad)
-        self.script_var = tk.StringVar(value=cfg["script_path"])
-        tk.Entry(self, textvariable=self.script_var, width=52).grid(row=3, column=0, **pad)
-        tk.Button(self, text="Browse…", command=self.browse_script).grid(row=3, column=1, **pad)
-
-        tk.Label(self, text="Port:", anchor="w").grid(row=4, column=0, sticky="w", **pad)
-        self.port_var = tk.StringVar(value=str(cfg["port"]))
-        tk.Entry(self, textvariable=self.port_var, width=10).grid(row=4, column=1, sticky="w", **pad)
-
-        btns = tk.Frame(self)
-        btns.grid(row=5, column=0, columnspan=2, pady=(10, 12))
-        tk.Button(btns, text="Save", width=10, command=self.save).pack(side="left", padx=6)
-        tk.Button(btns, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=6)
-
-    def browse_python(self):
-        path = filedialog.askopenfilename(
-            title="Select Python executable",
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
-        )
-        if path:
-            self.python_var.set(path)
-
-    def browse_script(self):
-        path = filedialog.askopenfilename(
-            title="Select ocr_server.py",
-            filetypes=[("Python file", "*.py"), ("All files", "*.*")],
-        )
-        if path:
-            self.script_var.set(path)
-
-    def save(self):
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            messagebox.showerror(APP_TITLE, "Port must be a number.")
-            return
-        if not self.python_var.get() or not self.script_var.get():
-            messagebox.showerror(APP_TITLE, "Both fields are required.")
-            return
-        self.cfg["python_path"] = self.python_var.get()
-        self.cfg["script_path"] = self.script_var.get()
-        self.cfg["port"] = port
-        save_config(self.cfg)
-        self.on_save(self.cfg)
-        self.destroy()
+def python_exe_path() -> Path:
+    return ENV_DIR / "python.exe"
 
 
+# ─────────────────────────────────────────────────────────────────────── UI ──
 class LauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -134,15 +99,23 @@ class LauncherApp(tk.Tk):
         self.minsize(480, 360)
         self.configure(bg="#0b0b0c")
 
-        self.cfg = load_config()
+        self.port = load_port()
         self.process: subprocess.Popen | None = None
         self.running = False
+        self.busy = False  # true during first-run environment setup
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        if not self.cfg["python_path"] or not self.cfg["script_path"]:
-            self.after(300, self.open_settings)
+        if not BUNDLED_SERVER_SCRIPT.exists():
+            # This is a packaging problem, not something the customer can
+            # fix — surface it plainly rather than pretending.
+            self.after(200, lambda: messagebox.showerror(
+                APP_TITLE,
+                "ocr_server.py is missing from this build.\n\n"
+                "This copy of the app was packaged incorrectly. "
+                "Please contact support.",
+            ))
 
     # ---------------------------------------------------------------- UI ----
     def _build_ui(self):
@@ -154,8 +127,6 @@ class LauncherApp(tk.Tk):
         top.pack(fill="x", padx=20, pady=(18, 8))
         tk.Label(top, text="EZI OCR Server", font=("Segoe UI", 15, "bold"),
                  fg=FG, bg="#0b0b0c").pack(side="left")
-        tk.Button(top, text="⚙", font=("Segoe UI", 12), width=3,
-                  command=self.open_settings).pack(side="right")
 
         card = tk.Frame(self, bg=CARD, highlightbackground="#2a2a2e", highlightthickness=1)
         card.pack(fill="x", padx=20, pady=8)
@@ -191,15 +162,14 @@ class LauncherApp(tk.Tk):
         self.log_text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
-    def open_settings(self):
-        SettingsDialog(self, self.cfg, on_save=lambda cfg: setattr(self, "cfg", cfg))
-
     # ------------------------------------------------------------ logging ----
     def log(self, line: str):
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", line if line.endswith("\n") else line + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        def _do():
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line if line.endswith("\n") else line + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        self.after(0, _do)
 
     def set_status(self, text: str, color: str, url: str = ""):
         self.status_label.configure(text=text)
@@ -210,54 +180,152 @@ class LauncherApp(tk.Tk):
     def toggle_server(self):
         if self.running:
             self.stop_server()
-        else:
+        elif not self.busy:
             self.start_server()
 
     def start_server(self):
-        if not self.cfg["python_path"] or not self.cfg["script_path"]:
-            messagebox.showwarning(APP_TITLE, "Set the Python path and ocr_server.py location first (⚙).")
-            self.open_settings()
+        if not BUNDLED_SERVER_SCRIPT.exists():
             return
+        self.toggle_btn.configure(state="disabled")
+        threading.Thread(target=self._start_flow, daemon=True).start()
 
-        script = Path(self.cfg["script_path"])
-        if not script.exists():
-            messagebox.showerror(APP_TITLE, f"ocr_server.py not found at:\n{script}")
-            return
+    def _start_flow(self):
+        """Runs off the UI thread: provision the env if needed, then launch."""
+        if not SETUP_MARKER.exists():
+            self.busy = True
+            self.after(0, lambda: self.toggle_btn.configure(text="Setting up…"))
+            self.set_status("Setting up (first run only)…", "#e8c44d")
+            ok = self._provision_environment()
+            self.busy = False
+            if not ok:
+                self.after(0, lambda: self.toggle_btn.configure(text="Start Server", state="normal"))
+                self.set_status("Setup failed", "#e05a4e")
+                return
+        self._launch_server_process()
 
-        self.log(f"Starting: {self.cfg['python_path']} {script.name}")
-        self.set_status("Starting…", "#e8c44d")
-        self.toggle_btn.configure(text="Starting…", state="disabled")
+    # -------------------------------------------------- first-run setup ----
+    def _run_step(self, cmd: list[str], cwd: Path | None = None) -> bool:
+        """Run a subprocess, streaming its output into the log. Returns success."""
+        self.log("$ " + " ".join(str(c) for c in cmd))
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(cwd) if cwd else None,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as e:
+            self.log(f"[!] {e}")
+            return False
+        for line in proc.stdout:
+            self.log(line.rstrip())
+        return proc.wait() == 0
+
+    def _download(self, url: str, dest: Path) -> bool:
+        self.log(f"Downloading {url}")
+        try:
+            def _progress(block_num, block_size, total_size):
+                if total_size > 0:
+                    pct = min(100, block_num * block_size * 100 // total_size)
+                    if block_num % 200 == 0:
+                        self.log(f"  … {pct}%")
+            urllib.request.urlretrieve(url, dest, reporthook=_progress)
+            return True
+        except Exception as e:
+            self.log(f"[!] Download failed: {e}")
+            return False
+
+    def _provision_environment(self) -> bool:
+        """One-time: download a private Python, install pip + all deps."""
+        ENV_DIR.mkdir(parents=True, exist_ok=True)
+        self.log("=" * 50)
+        self.log("First run: setting up the server environment.")
+        self.log("This needs an internet connection and downloads several")
+        self.log("GB of files (PyTorch, the AI model, etc). One-time only.")
+        self.log("=" * 50)
+
+        # 1. Download + extract embeddable Python
+        if not python_exe_path().exists():
+            zip_path = ENV_DIR / "python-embed.zip"
+            if not self._download(EMBED_PYTHON_URL, zip_path):
+                return False
+            import zipfile
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(ENV_DIR)
+            zip_path.unlink(missing_ok=True)
+
+            # Enable site-packages (embeddable python ships with it disabled)
+            pth_files = list(ENV_DIR.glob("python*._pth"))
+            if pth_files:
+                pth = pth_files[0]
+                text = pth.read_text()
+                text = text.replace("#import site", "import site")
+                if "import site" not in text:
+                    text += "\nimport site\n"
+                pth.write_text(text)
+
+        # 2. Install pip
+        get_pip = ENV_DIR / "get-pip.py"
+        if not self._download(GET_PIP_URL, get_pip):
+            return False
+        if not self._run_step([str(python_exe_path()), str(get_pip), "--no-warn-script-location"]):
+            return False
+
+        # 3. Install torch (CUDA build) then the rest of the requirements
+        self.log("Installing PyTorch (CUDA build) — this is the biggest download…")
+        if not self._run_step([
+            str(python_exe_path()), "-m", "pip", "install",
+            "torch", "--index-url", TORCH_INDEX_URL,
+        ]):
+            return False
+
+        self.log("Installing remaining dependencies…")
+        if not self._run_step([
+            str(python_exe_path()), "-m", "pip", "install",
+            "-r", str(BUNDLED_REQUIREMENTS),
+        ]):
+            return False
+
+        SETUP_MARKER.write_text("ok")
+        self.log("[✓] Environment ready.")
+        return True
+
+    # -------------------------------------------------------- run server ----
+    def _launch_server_process(self):
+        self.log(f"Starting server on port {self.port}…")
+        self.after(0, lambda: self.set_status("Starting…", "#e8c44d"))
+        self.after(0, lambda: self.toggle_btn.configure(text="Starting…", state="disabled"))
+
+        env = os.environ.copy()
+        env["EZI_OCR_PORT"] = str(self.port)
 
         try:
             self.process = subprocess.Popen(
-                [self.cfg["python_path"], str(script)],
-                cwd=str(script.parent),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
+                [str(python_exe_path()), str(BUNDLED_SERVER_SCRIPT)],
+                cwd=str(BUNDLED_SERVER_SCRIPT.parent),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except Exception as e:
             self.log(f"[!] Failed to start: {e}")
-            self.set_status("Error", "#e05a4e")
-            self.toggle_btn.configure(text="Start Server", state="normal")
+            self.after(0, lambda: self.set_status("Error", "#e05a4e"))
+            self.after(0, lambda: self.toggle_btn.configure(text="Start Server", state="normal"))
             return
 
         self.running = True
-        self.toggle_btn.configure(text="Stop Server", state="normal", bg="#3a3a3e", fg="#e7e7e8")
+        self.after(0, lambda: self.toggle_btn.configure(
+            text="Stop Server", state="normal", bg="#3a3a3e", fg="#e7e7e8"))
         threading.Thread(target=self._pump_output, daemon=True).start()
 
     def _pump_output(self):
-        port = self.cfg["port"]
         seen_ready = False
         for line in self.process.stdout:
             self.log(line.rstrip())
             if not seen_ready and ("Uvicorn running" in line or "Application startup complete" in line):
                 seen_ready = True
-                url = f"http://{local_ip()}:{port}"
+                url = f"http://{local_ip()}:{self.port}"
                 self.after(0, lambda: self.set_status("Running", "#4caf6d", f"Enter this in the app: {url}"))
-        # process ended (crashed, or stopped)
         self.after(0, self._on_process_ended)
 
     def _on_process_ended(self):

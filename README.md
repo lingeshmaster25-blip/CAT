@@ -1,50 +1,73 @@
 # EZI OCR Server Launcher
 
-A one-button front end for `backend/ocr_server.py`. It doesn't bundle
-Python, torch, transformers, or the model — it launches the Python
-environment you already have working on this PC (the same one you use to
-run `ocr_server.py` today) as a background process, and shows its status
-and log output in a clean window instead of an IDE console.
+A one-button, self-contained front end for `ocr_server.py`. The server
+script and its dependency list are bundled inside the app — the customer
+never sees a file picker, a Python path, or any settings screen.
 
-## First run
+## What the customer sees
 
-1. Open the app, click the ⚙ (gear) in the top right.
-2. **Python executable** — browse to the `python.exe` inside the
-   environment/venv that already has `torch`, `transformers`,
-   `fastapi`, etc. installed (the one you currently use to run the server).
-3. **ocr_server.py location** — browse to `backend/ocr_server.py`.
-4. **Port** — leave as `8000` unless you changed it.
-5. Save.
+1. Double-click the app.
+2. Click **Start Server**.
+3. First time only: a "Setting up…" status while the app downloads its own
+   private Python environment and the ML dependencies (PyTorch,
+   transformers, etc.) — this needs internet access and can take a while
+   depending on connection speed. Progress streams into the Log panel.
+4. Once ready, the status turns green and shows the URL to enter in the EZI
+   app's Settings (⚙) screen, e.g. `http://192.168.1.23:8000`. The Qwen2-VL
+   model itself (~4 GB) also downloads automatically the first time the
+   server actually starts — same one-time cost, visible in the log.
+5. Every run after that skips straight to step 2 — nothing is re-downloaded.
 
-These are remembered in `server_launcher_config.json`, saved next to the
-app — you only need to do this once per machine.
+Nothing is installed system-wide. The private environment lives under
+`%LOCALAPPDATA%\EZI OCR Server\`, isolated from anything else on the
+customer's machine, and is unaffected by re-installing or replacing the
+launcher `.exe` itself.
 
-## Using it
+## How it works (for you, not the customer)
 
-- **Start Server** — launches `ocr_server.py` in the background. The log
-  panel shows the same output you'd see in a terminal (model loading,
-  request logs, etc.). Once ready, the status turns green and shows the
-  URL to enter in the EZI app's Settings (⚙) screen, e.g.
-  `http://192.168.1.23:8000`.
-- **Stop Server** — same button, now labeled Stop — cleanly terminates it.
-- Closing the window while the server is running asks for confirmation and
-  stops it first (no orphaned background process).
+- `ocr_server.py` and `requirements.txt` are bundled into the `.exe` as
+  data files via PyInstaller's `--add-data`.
+- On first "Start Server" click, `server_launcher.py`:
+  1. Downloads the official Windows *embeddable* Python distribution (not a
+     system install — just a folder of files) into
+     `%LOCALAPPDATA%\EZI OCR Server\python_env\`.
+  2. Bootstraps `pip` into it via `get-pip.py`.
+  3. Installs the CUDA build of `torch` (see `TORCH_INDEX_URL` in
+     `server_launcher.py` — set this to match the CUDA version your
+     customers' NVIDIA drivers support), then the rest of
+     `requirements.txt`.
+  4. Marks setup complete and launches `ocr_server.py` using that private
+     Python.
+- On every later run, setup is skipped and it goes straight to launching
+  the server.
+
+### If you need to change the port
+
+Ship-time default is `8000`. It's stored in
+`%LOCALAPPDATA%\EZI OCR Server\port.json` — edit that once on the target
+machine if a customer's setup needs a different port; there is deliberately
+no in-app UI for this so the customer never has to think about it.
 
 ## Building the Windows .exe
 
 Same pattern as the main EZI app: GitHub Actions builds it on a Windows
 runner, no local Windows machine needed.
 
-1. Push this folder to GitHub (as part of the same repo, or its own).
+1. Push this folder to GitHub.
 2. Actions tab → **Build OCR Server Launcher** → Run workflow (or push to
-   `main` — it runs automatically for changes under `server-launcher/`).
+   `main`).
 3. Download the **EZI-OCR-Server-Launcher-Windows** artifact once green —
-   it's a single portable `.exe`, no installer needed.
+   it's a single portable `.exe`. Hand that one file to the customer; the
+   rest happens on their machine the first time they click Start.
 
 ### Build locally instead
 
 ```bash
 pip install -r requirements-build.txt
-pyinstaller --onefile --windowed --name "EZI OCR Server Launcher" server_launcher.py
+pyinstaller --onefile --windowed --name "EZI OCR Server Launcher" ^
+  --add-data "ocr_server.py;." ^
+  --add-data "requirements.txt;." ^
+  server_launcher.py
 ```
+
 Output lands in `dist/`.
