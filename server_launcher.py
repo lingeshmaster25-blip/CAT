@@ -66,7 +66,7 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 # changes. Machines that already ran setup under an older version will
 # automatically redo just the pip-install steps (not the ~100MB Python
 # download) instead of silently keeping stale/missing packages.
-SETUP_VERSION = "3"
+SETUP_VERSION = "4"
 
 DEFAULT_PORT = 8000
 
@@ -293,6 +293,7 @@ class LauncherApp(tk.Tk):
         self.log("Installing PyTorch (CUDA build) — this is the biggest download…")
         if not self._run_step([
             str(python_exe_path()), "-m", "pip", "install",
+            "--upgrade", "--force-reinstall",
             "torch", "torchvision", "--index-url", TORCH_INDEX_URL,
         ]):
             return False
