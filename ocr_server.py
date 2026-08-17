@@ -33,6 +33,7 @@ import barcode
 from barcode.writer import ImageWriter
 import win32print
 import win32ui
+import win32con
 from PIL import ImageWin
 
 # ── API Key ───────────────────────────────────────────────────────────────────
@@ -47,6 +48,13 @@ API_KEY = "EZI-TRILO-OCR-2025"
 # whatever Windows has as the default printer.
 PRINT_CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "printer.json"
 DEFAULT_PRINTER_NAME = "Brother QL-800"
+
+# Physical label size — confirmed exact stock size, DK-1201 die-cut.
+# Explicitly forced via DEVMODE at print time (see set_label_devmode())
+# rather than trusting whatever the driver's ambient/last-used settings
+# happen to be, so this stays correct even if those settings ever change.
+LABEL_WIDTH_MM = 29
+LABEL_HEIGHT_MM = 90
 
 # ── Shape library storage ────────────────────────────────────────────────────
 # Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
@@ -274,13 +282,60 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, widt
     return label
 
 
+def get_forced_label_devmode(printer_name: str):
+    """
+    Build a DEVMODE forcing the exact physical label size (LABEL_WIDTH_MM x
+    LABEL_HEIGHT_MM), instead of trusting whatever the driver's ambient/
+    last-used print settings currently are.
+
+    NOTE: this is the one piece of this file I could not test against real
+    hardware — win32print/win32ui only run on Windows, and I have no
+    Windows machine available. This follows the standard, widely-used
+    pywin32 pattern for setting a custom paper size, but if it throws or
+    the driver rejects it, print_label() falls back to the previous
+    (confirmed-working) ambient-settings behavior rather than failing the
+    print entirely.
+    """
+    hPrinter = win32print.OpenPrinter(printer_name)
+    try:
+        properties = win32print.GetPrinter(hPrinter, 2)
+        devmode = properties["pDevMode"]
+
+        # DEVMODE paper width/length are in tenths of a millimetre.
+        devmode.PaperSize = 0  # 0 = custom, use PaperWidth/PaperLength below
+        devmode.PaperWidth = int(LABEL_WIDTH_MM * 10)
+        devmode.PaperLength = int(LABEL_HEIGHT_MM * 10)
+        devmode.Fields |= win32con.DM_PAPERSIZE | win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH
+
+        # Let the driver validate/normalize our requested settings — some
+        # drivers adjust custom sizes to the nearest size they actually
+        # support, which is exactly why this step matters.
+        win32print.DocumentProperties(
+            0, hPrinter, printer_name, devmode, devmode,
+            win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+        )
+        return devmode
+    finally:
+        win32print.ClosePrinter(hPrinter)
+
+
 def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     """Send a label straight to the Windows-installed printer via GDI —
     confirmed working through the normal Windows print system."""
     printer_name = load_printer_name()
 
     hDC = win32ui.CreateDC()
-    hDC.CreatePrinterDC(printer_name)
+    try:
+        devmode = get_forced_label_devmode(printer_name)
+        hDC.CreateDC("WINSPOOL", printer_name, None, devmode)
+        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {LABEL_HEIGHT_MM}mm via DEVMODE.")
+    except Exception as e:
+        # Untested path above failed for some reason — fall back to the
+        # previously-working approach (whatever the driver's current
+        # settings are) rather than failing the print entirely.
+        print(f"[!] Couldn't force label size via DEVMODE ({e}); falling back to ambient printer settings.")
+        hDC.CreatePrinterDC(printer_name)
+
     hDC.StartDoc("EZI Label")
     hDC.StartPage()
 
