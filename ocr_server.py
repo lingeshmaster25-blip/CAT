@@ -24,7 +24,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from PIL import Image, ImageDraw, ImageFont
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, CLIPModel, CLIPProcessor
 from qwen_vl_utils import process_vision_info
@@ -101,7 +101,7 @@ app.add_middleware(
 async def verify_api_key(request: Request, call_next):
     """Reject any request that doesn't carry the correct API key.
     /health is exempt so the settings screen can ping without a key."""
-    if request.method == "OPTIONS" or request.url.path in ("/health", "/"):
+    if request.method == "OPTIONS" or request.url.path in ("/health", "/", "/printer/last-label"):
         return await call_next(request)
     key = request.headers.get("X-API-Key", "")
     if key != API_KEY:
@@ -231,47 +231,71 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, widt
     printer driver reports (passed in from print_label(), via GDI
     DeviceCaps) — Windows/the driver handles fitting this to the actual
     label stock configured in the printer's properties.
-    Barcode (Code128) on the left, human-readable text on the right.
+
+    Adapts layout to whatever orientation is actually reported: landscape
+    (wider than tall) puts the barcode left / text right; portrait (taller
+    than wide) stacks barcode on top of text instead. Assuming landscape
+    unconditionally produced a badly squeezed, nearly-blank result when the
+    printer's current orientation setting was actually Portrait.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
+    landscape = width_px >= height_px
 
-    code_value = part_number or serial_number or "UNKNOWN"
+    # Encode both numbers in the barcode when both exist, not just the part
+    # number — a scanner reading this barcode later should get the full
+    # picture, not just half of it.
+    if part_number and serial_number:
+        code_value = f"{part_number}|{serial_number}"
+    else:
+        code_value = part_number or serial_number or "UNKNOWN"
     barcode_class = barcode.get_barcode_class("code128")
     bc = barcode_class(code_value, writer=ImageWriter())
     bc_img = bc.render(writer_options={
         "module_height": 8.0,
-        "font_size": 0,       # we draw our own text below, not the writer's
+        "font_size": 0,       # we draw our own text, not the writer's
         "text_distance": 0,
         "quiet_zone": 1,
     })
 
-    # Fit the barcode into the left ~55% of the label, keeping aspect ratio.
-    bc_area_w = int(width_px * 0.55)
-    scale = min(bc_area_w / bc_img.width, height_px * 0.85 / bc_img.height)
-    bc_resized = bc_img.resize((int(bc_img.width * scale), int(bc_img.height * scale)))
-    label.paste(bc_resized, (10, (height_px - bc_resized.height) // 2))
-
-    # Human-readable text to the right of the barcode.
     draw = ImageDraw.Draw(label)
     try:
-        font = ImageFont.truetype("arial.ttf", size=int(height_px * 0.16))
-        font_small = ImageFont.truetype("arial.ttf", size=int(height_px * 0.12))
+        font = ImageFont.truetype("arial.ttf", size=int(min(width_px, height_px) * 0.09))
+        font_small = ImageFont.truetype("arial.ttf", size=int(min(width_px, height_px) * 0.065))
     except Exception:
         font = ImageFont.load_default()
         font_small = font
 
-    text_x = bc_area_w + 20
-    y = int(height_px * 0.15)
     lines = [f"P/N: {part_number}"]
     if serial_number:
         lines.append(f"S/N: {serial_number}")
     if part_name:
         lines.append(part_name[:30])
 
-    for i, line in enumerate(lines):
-        f = font if i == 0 else font_small
-        draw.text((text_x, y), line, fill="black", font=f)
-        y += int(height_px * 0.28)
+    if landscape:
+        # Barcode on the left, text to the right.
+        bc_area_w = int(width_px * 0.55)
+        scale = min(bc_area_w / bc_img.width, height_px * 0.85 / bc_img.height)
+        bc_resized = bc_img.resize((max(1, int(bc_img.width * scale)), max(1, int(bc_img.height * scale))))
+        label.paste(bc_resized, (10, (height_px - bc_resized.height) // 2))
+
+        text_x = bc_area_w + 20
+        y = int(height_px * 0.15)
+        for i, line in enumerate(lines):
+            f = font if i == 0 else font_small
+            draw.text((text_x, y), line, fill="black", font=f)
+            y += int(height_px * 0.28)
+    else:
+        # Barcode on top, text stacked below — fits a tall/narrow canvas.
+        bc_area_h = int(height_px * 0.5)
+        scale = min(width_px * 0.9 / bc_img.width, bc_area_h / bc_img.height)
+        bc_resized = bc_img.resize((max(1, int(bc_img.width * scale)), max(1, int(bc_img.height * scale))))
+        label.paste(bc_resized, ((width_px - bc_resized.width) // 2, 10))
+
+        y = bc_area_h + 20
+        for i, line in enumerate(lines):
+            f = font if i == 0 else font_small
+            draw.text((width_px // 2, y), line, fill="black", font=f, anchor="ma")
+            y += int(height_px * 0.09)
 
     return label
 
@@ -290,8 +314,22 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     # the printable area in pixels at the printer's current resolution.
     printable_w = hDC.GetDeviceCaps(8)
     printable_h = hDC.GetDeviceCaps(10)
+    print(f"[i] Printer reports printable area: {printable_w} x {printable_h} px")
 
     label = build_label_image(part_number, serial_number, part_name, printable_w, printable_h)
+
+    # Save every generated label so it can be inspected/verified — this is
+    # what actually gets sent to the printer, so if nothing is coming out
+    # physically, checking this image first tells us whether the problem
+    # is "the image is blank/wrong" vs "the image is fine but printing it
+    # fails somewhere in GDI/the driver."
+    debug_path = PRINT_CONFIG_FILE.parent / "last_label_preview.png"
+    try:
+        PRINT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        label.save(debug_path, "PNG")
+    except Exception as e:
+        print(f"[!] Couldn't save label preview: {e}")
+
     dib = ImageWin.Dib(label)
     dib.draw(hDC.GetHandleOutput(), (0, 0, printable_w, printable_h))
 
@@ -314,6 +352,17 @@ def save_shape_library(entries: list[dict]) -> None:
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/printer/last-label")
+async def last_label_preview():
+    """View the actual image generated for the most recent print attempt —
+    open this in a browser to check whether it has visible content or is
+    blank/malformed, without needing physical access to the printer."""
+    debug_path = PRINT_CONFIG_FILE.parent / "last_label_preview.png"
+    if not debug_path.exists():
+        return JSONResponse({"error": "No label has been generated yet."}, status_code=404)
+    return FileResponse(debug_path, media_type="image/png")
+
 
 @app.get("/printer")
 async def get_printer_config():
