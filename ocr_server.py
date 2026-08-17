@@ -370,6 +370,39 @@ def save_shape_library(entries: list[dict]) -> None:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@app.get("/printer/usb-scan")
+async def usb_scan():
+    """
+    Diagnostic: list EVERY USB device pyusb can currently see, not just
+    Brother printers. Use this to tell apart 'the Zadig driver swap didn't
+    take at all' (nothing shows up, or the printer entry is missing) from
+    'wrong identifier/interface' (printer shows up but with different
+    vendor/product IDs than expected).
+    """
+    import usb.core
+    import usb.util
+    try:
+        devices = list(usb.core.find(find_all=True))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    results = []
+    for d in devices:
+        try:
+            manufacturer = usb.util.get_string(d, d.iManufacturer) if d.iManufacturer else None
+            product = usb.util.get_string(d, d.iProduct) if d.iProduct else None
+        except Exception:
+            manufacturer = product = None
+        results.append({
+            "idVendor": hex(d.idVendor),
+            "idProduct": hex(d.idProduct),
+            "manufacturer": manufacturer,
+            "product": product,
+            "is_brother": d.idVendor == 0x04F9,
+        })
+    return {"count": len(results), "devices": results}
+
+
 @app.get("/printer")
 async def get_printer_config():
     """Show the configured printer identifier and what's actually discoverable on USB right now."""
