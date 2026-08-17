@@ -34,6 +34,21 @@ from barcode.writer import ImageWriter
 from brother_ql.raster import BrotherQLRaster
 from brother_ql.conversion import convert as ql_convert
 from brother_ql.backends.helpers import send as ql_send, discover as ql_discover
+from brother_ql.devicedependent import label_type_specs as ql_label_specs
+
+import libusb_package
+
+# PyUSB (used internally by brother_ql) needs libusb's DLL to talk to the
+# printer over USB. Rather than requiring a separate manual DLL install on
+# the PC, libusb_package bundles it via pip — we just need to tell Windows
+# where to find it before any USB calls happen.
+if hasattr(os, "add_dll_directory"):
+    try:
+        _libusb_dll_path = libusb_package.get_library_path()
+        if _libusb_dll_path:
+            os.add_dll_directory(str(Path(_libusb_dll_path).parent))
+    except Exception as _e:
+        print(f"[!] Couldn't register libusb DLL directory (printing may fail): {_e}")
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 # Change this to any secret string — must match the key baked into the app
@@ -54,8 +69,6 @@ QL_LABEL_SIZE = "29x90"
 # Brother QL-800's USB Vendor:Product ID. Used as the default guess before
 # falling back to discovery if this doesn't match what's connected.
 QL_DEFAULT_IDENTIFIER = "usb://0x04f9:0x209b"
-
-from brother_ql.devicedependent import label_type_specs as ql_label_specs
 
 # Printable area for QL_LABEL_SIZE, in the printer's native (portrait)
 # orientation: (width_across_tape_px, length_along_feed_px) = (306, 991)

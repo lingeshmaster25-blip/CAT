@@ -11,6 +11,7 @@ qwen-vl-utils
 
 # Label printing — Brother QL-800 over direct USB (brother_ql), NOT through
 # a Windows print driver or P-touch Editor. Requires a one-time driver swap
-# on the PC using Zadig — see the printing section in README.md.
+# on the PC using Zadig — see PRINTER_SETUP.md.
 brother_ql
 pyusb
+libusb-package
