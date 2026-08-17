@@ -39,16 +39,27 @@ from brother_ql.devicedependent import label_type_specs as ql_label_specs
 import libusb_package
 
 # PyUSB (used internally by brother_ql) needs libusb's DLL to talk to the
-# printer over USB. Rather than requiring a separate manual DLL install on
-# the PC, libusb_package bundles it via pip — we just need to tell Windows
-# where to find it before any USB calls happen.
-if hasattr(os, "add_dll_directory"):
-    try:
-        _libusb_dll_path = libusb_package.get_library_path()
-        if _libusb_dll_path:
-            os.add_dll_directory(str(Path(_libusb_dll_path).parent))
-    except Exception as _e:
-        print(f"[!] Couldn't register libusb DLL directory (printing may fail): {_e}")
+# printer over USB. brother_ql calls usb.core.find() without specifying a
+# backend, so PyUSB falls back to its own default discovery chain — which
+# tries usb.backend.libusb1.get_backend() first, and that call resolves the
+# DLL via ctypes.util.find_library(), which does NOT know to look inside
+# this package's bundled binary. The result is "NoBackendError: No backend
+# available" even though a working libusb IS present on the system (via
+# libusb_package) — find_library() just never looks there.
+#
+# Fix: monkey-patch get_backend() itself so PyUSB's default chain picks up
+# libusb_package's already-resolved backend directly, bypassing
+# find_library()'s search entirely.
+try:
+    import usb.backend.libusb1 as _libusb1_module
+    _bundled_backend = libusb_package.get_libusb1_backend()
+    if _bundled_backend is not None:
+        _libusb1_module.get_backend = lambda *a, **k: _bundled_backend
+        print("[✓] Using bundled libusb backend for printer USB access.")
+    else:
+        print("[!] libusb_package couldn't resolve a backend — printing will likely fail with 'No backend available'.")
+except Exception as _e:
+    print(f"[!] Couldn't set up libusb backend (printing may fail): {_e}")
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 # Change this to any secret string — must match the key baked into the app
