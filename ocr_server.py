@@ -242,25 +242,34 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, widt
     else:
         code_value = part_number or serial_number or "UNKNOWN"
 
+    # Render the barcode natively at (very close to) its final size by
+    # computing the DPI needed, rather than rendering small and resizing up
+    # — any resize/interpolation step blends adjacent black/white pixels at
+    # bar edges, which is invisible on screen but shifts effective bar
+    # widths just enough to break real barcode scanners. This renders each
+    # bar at its correct pixel width directly, no interpolation involved.
     barcode_class = barcode.get_barcode_class("code128")
-    bc = barcode_class(code_value, writer=ImageWriter())
-    bc_img = bc.render(writer_options={
-        "module_height": 15.0,
-        "font_size": 0,
-        "text_distance": 0,
-        "quiet_zone": 1,
-    })
+    bc_opts = {"module_height": 15.0, "font_size": 0, "text_distance": 0, "quiet_zone": 1}
 
-    # Fill the label with a small margin, keeping aspect ratio, centered.
-    margin = 0.06
-    max_w = int(width_px * (1 - margin * 2))
-    max_h = int(height_px * (1 - margin * 2))
-    scale = min(max_w / bc_img.width, max_h / bc_img.height)
-    bc_resized = bc_img.resize((max(1, int(bc_img.width * scale)), max(1, int(bc_img.height * scale))))
+    max_w = int(width_px * (1 - 0.06 * 2))
+    max_h = int(height_px * (1 - 0.06 * 2))
 
-    x = (width_px - bc_resized.width) // 2
-    y = (height_px - bc_resized.height) // 2
-    label.paste(bc_resized, (x, y))
+    ref_dpi = 300
+    ref_bc = barcode_class(code_value, writer=ImageWriter(dpi=ref_dpi))
+    ref_img = ref_bc.render(writer_options=bc_opts)
+
+    scale_needed = min(max_w / ref_img.width, max_h / ref_img.height)
+    final_dpi = max(72, int(ref_dpi * scale_needed))
+
+    if final_dpi == ref_dpi:
+        bc_final = ref_img
+    else:
+        bc = barcode_class(code_value, writer=ImageWriter(dpi=final_dpi))
+        bc_final = bc.render(writer_options=bc_opts)
+
+    x = (width_px - bc_final.width) // 2
+    y = (height_px - bc_final.height) // 2
+    label.paste(bc_final, (x, y))
 
     return label
 
