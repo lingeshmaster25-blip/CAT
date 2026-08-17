@@ -31,65 +31,22 @@ from qwen_vl_utils import process_vision_info
 
 import barcode
 from barcode.writer import ImageWriter
-from brother_ql.raster import BrotherQLRaster
-from brother_ql.conversion import convert as ql_convert
-from brother_ql.backends.helpers import send as ql_send, discover as ql_discover
-from brother_ql.devicedependent import label_type_specs as ql_label_specs
-
-import libusb_package
-
-# PyUSB (used internally by brother_ql) needs libusb's DLL to talk to the
-# printer over USB. brother_ql calls usb.core.find() without specifying a
-# backend, so PyUSB falls back to its own default discovery chain — which
-# tries usb.backend.libusb1.get_backend() first, and that call resolves the
-# DLL via ctypes.util.find_library(), which does NOT know to look inside
-# this package's bundled binary. The result is "NoBackendError: No backend
-# available" even though a working libusb IS present on the system (via
-# libusb_package) — find_library() just never looks there.
-#
-# Fix: monkey-patch get_backend() itself so PyUSB's default chain picks up
-# libusb_package's already-resolved backend directly, bypassing
-# find_library()'s search entirely.
-try:
-    import usb.backend.libusb1 as _libusb1_module
-    _bundled_backend = libusb_package.get_libusb1_backend()
-    if _bundled_backend is not None:
-        _libusb1_module.get_backend = lambda *a, **k: _bundled_backend
-        print("[✓] Using bundled libusb backend for printer USB access.")
-    else:
-        print("[!] libusb_package couldn't resolve a backend — printing will likely fail with 'No backend available'.")
-except Exception as _e:
-    print(f"[!] Couldn't set up libusb backend (printing may fail): {_e}")
+import win32print
+import win32ui
+from PIL import ImageWin
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 # Change this to any secret string — must match the key baked into the app
 API_KEY = "EZI-TRILO-OCR-2025"
 
-# ── Printer configuration (Brother QL-800, direct USB, no Windows driver) ───
-# QL-800 does NOT print through the normal Windows printer queue on this
-# setup (confirmed — it only works via P-touch Editor Lite's own protocol).
-# brother_ql talks to it directly over USB instead, bypassing both Windows
-# printing and P-touch Editor entirely. This requires a one-time driver
-# swap on the PC — see README notes near the bottom of this file.
+# ── Printer configuration (Brother QL-800, via the normal Windows printer
+# queue — confirmed working) ─────────────────────────────────────────────────
+# Earlier assumption that this printer only worked through P-touch Editor
+# Lite turned out to be wrong — it IS installed as a normal Windows printer
+# and prints correctly through it. If printer_name isn't set, falls back to
+# whatever Windows has as the default printer.
 PRINT_CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "printer.json"
-
-QL_MODEL = "QL-800"
-# DK-1201 die-cut label (29mm x 90mm) — matches the size shown selected in
-# P-touch Editor. Change if you're using different label stock.
-QL_LABEL_SIZE = "29x90"
-# Brother QL-800's USB Vendor:Product ID. Used as the default guess before
-# falling back to discovery if this doesn't match what's connected.
-QL_DEFAULT_IDENTIFIER = "usb://0x04f9:0x209b"
-
-# Printable area for QL_LABEL_SIZE, in the printer's native (portrait)
-# orientation: (width_across_tape_px, length_along_feed_px) = (306, 991)
-# for 29x90 die-cut. Die-cut labels require an EXACT pixel match — unlike
-# endless labels, brother_ql does not resize them to fit, it raises a hard
-# error on mismatch. Building our landscape design at exactly
-# (length_px, width_px) and passing rotate="auto" lets brother_ql detect
-# the swapped dimensions and rotate it into the native orientation itself.
-_QL_DOTS_PRINTABLE = ql_label_specs[QL_LABEL_SIZE]["dots_printable"]  # (306, 991)
-LABEL_IMAGE_SIZE_PX = (_QL_DOTS_PRINTABLE[1], _QL_DOTS_PRINTABLE[0])   # (991, 306) landscape
+DEFAULT_PRINTER_NAME = "Brother QL-800"
 
 # ── Shape library storage ────────────────────────────────────────────────────
 # Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
@@ -144,7 +101,7 @@ app.add_middleware(
 async def verify_api_key(request: Request, call_next):
     """Reject any request that doesn't carry the correct API key.
     /health is exempt so the settings screen can ping without a key."""
-    if request.method == "OPTIONS" or request.url.path in ("/health", "/", "/printer/usb-scan"):
+    if request.method == "OPTIONS" or request.url.path in ("/health", "/"):
         return await call_next(request)
     key = request.headers.get("X-API-Key", "")
     if key != API_KEY:
@@ -261,21 +218,21 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot  # both vectors are already L2-normalized, so dot == cosine sim
 
 
-def load_printer_identifier() -> str:
+def load_printer_name() -> str:
     try:
-        return json.loads(PRINT_CONFIG_FILE.read_text()).get("printer_identifier", "") or QL_DEFAULT_IDENTIFIER
+        return json.loads(PRINT_CONFIG_FILE.read_text()).get("printer_name", "") or DEFAULT_PRINTER_NAME
     except Exception:
-        return QL_DEFAULT_IDENTIFIER
+        return DEFAULT_PRINTER_NAME
 
 
-def build_label_image(part_number: str, serial_number: str, part_name: str) -> Image.Image:
+def build_label_image(part_number: str, serial_number: str, part_name: str, width_px: int, height_px: int) -> Image.Image:
     """
-    Render a label as a PIL image at EXACTLY the pixel size brother_ql
-    requires for QL_LABEL_SIZE (see LABEL_IMAGE_SIZE_PX above) — die-cut
-    labels are rejected outright if the size doesn't match precisely.
+    Render a label as a PIL image sized to exactly the printable area the
+    printer driver reports (passed in from print_label(), via GDI
+    DeviceCaps) — Windows/the driver handles fitting this to the actual
+    label stock configured in the printer's properties.
     Barcode (Code128) on the left, human-readable text on the right.
     """
-    width_px, height_px = LABEL_IMAGE_SIZE_PX
     label = Image.new("RGB", (width_px, height_px), "white")
 
     code_value = part_number or serial_number or "UNKNOWN"
@@ -319,43 +276,31 @@ def build_label_image(part_number: str, serial_number: str, part_name: str) -> I
     return label
 
 
-def print_label_image(label: Image.Image) -> None:
-    """Send a label image straight to the QL-800 over USB via brother_ql —
-    no Windows print driver or P-touch Editor involved."""
-    identifier = load_printer_identifier()
+def print_label(part_number: str, serial_number: str, part_name: str) -> None:
+    """Send a label straight to the Windows-installed printer via GDI —
+    confirmed working through the normal Windows print system."""
+    printer_name = load_printer_name()
 
-    qlr = BrotherQLRaster(QL_MODEL)
-    qlr.exception_on_warning = True
-    instructions = ql_convert(
-        qlr=qlr,
-        images=[label],
-        label=QL_LABEL_SIZE,
-        rotate="auto",
-        threshold=70.0,
-        dither=False,
-        compress=False,
-        red=False,
-        dpi_600=False,
-        hq=True,
-        cut=True,
-    )
+    hDC = win32ui.CreateDC()
+    hDC.CreatePrinterDC(printer_name)
+    hDC.StartDoc("EZI Label")
+    hDC.StartPage()
 
-    try:
-        ql_send(instructions=instructions, printer_identifier=identifier, backend_identifier="pyusb", blocking=True)
-    except Exception as first_error:
-        # The configured/default identifier didn't work — try discovering
-        # what's actually connected and retry once with that instead.
-        found = ql_discover(backend_identifier="pyusb")
-        if not found:
-            raise RuntimeError(
-                f"Couldn't reach the printer at {identifier!r}, and no QL printers were "
-                f"discovered on USB. Original error: {first_error}"
-            )
-        actual_identifier = found[0]["identifier"]
-        ql_send(instructions=instructions, printer_identifier=actual_identifier, backend_identifier="pyusb", blocking=True)
-        # Remember the identifier that actually worked for next time.
-        PRINT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PRINT_CONFIG_FILE.write_text(json.dumps({"printer_identifier": actual_identifier}))
+    # HORZRES=8, VERTRES=10 — standard Windows GDI DeviceCaps indices for
+    # the printable area in pixels at the printer's current resolution.
+    printable_w = hDC.GetDeviceCaps(8)
+    printable_h = hDC.GetDeviceCaps(10)
+
+    label = build_label_image(part_number, serial_number, part_name, printable_w, printable_h)
+    dib = ImageWin.Dib(label)
+    dib.draw(hDC.GetHandleOutput(), (0, 0, printable_w, printable_h))
+
+    hDC.EndPage()
+    hDC.EndDoc()
+    hDC.DeleteDC()
+
+
+def load_shape_library() -> list[dict]:
     if not SHAPE_INDEX_FILE.exists():
         return []
     try:
@@ -370,78 +315,41 @@ def save_shape_library(entries: list[dict]) -> None:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/printer/usb-scan")
-async def usb_scan():
-    """
-    Diagnostic: list EVERY USB device pyusb can currently see, not just
-    Brother printers. Use this to tell apart 'the Zadig driver swap didn't
-    take at all' (nothing shows up, or the printer entry is missing) from
-    'wrong identifier/interface' (printer shows up but with different
-    vendor/product IDs than expected).
-    """
-    import usb.core
-    import usb.util
-    try:
-        devices = list(usb.core.find(find_all=True))
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-    results = []
-    for d in devices:
-        try:
-            manufacturer = usb.util.get_string(d, d.iManufacturer) if d.iManufacturer else None
-            product = usb.util.get_string(d, d.iProduct) if d.iProduct else None
-        except Exception:
-            manufacturer = product = None
-        results.append({
-            "idVendor": hex(d.idVendor),
-            "idProduct": hex(d.idProduct),
-            "manufacturer": manufacturer,
-            "product": product,
-            "is_brother": d.idVendor == 0x04F9,
-        })
-    return {"count": len(results), "devices": results}
-
-
 @app.get("/printer")
 async def get_printer_config():
-    """Show the configured printer identifier and what's actually discoverable on USB right now."""
+    """Show the configured printer name and what Windows currently has installed."""
     try:
-        found = ql_discover(backend_identifier="pyusb")
+        installed = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
     except Exception as e:
-        found = []
-        discover_error = str(e)
-    else:
-        discover_error = None
+        installed = []
+        print(f"[!] Couldn't enumerate printers: {e}")
     return {
-        "configured": load_printer_identifier(),
-        "discovered": found,
-        "discover_error": discover_error,
+        "configured": load_printer_name(),
+        "windows_default": win32print.GetDefaultPrinter(),
+        "installed": installed,
     }
 
 
 @app.post("/printer")
-async def set_printer_config(printer_identifier: str = Form(...)):
+async def set_printer_config(printer_name: str = Form(...)):
     PRINT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PRINT_CONFIG_FILE.write_text(json.dumps({"printer_identifier": printer_identifier}))
-    return {"printer_identifier": printer_identifier}
+    PRINT_CONFIG_FILE.write_text(json.dumps({"printer_name": printer_name}))
+    return {"printer_name": printer_name}
 
 
 @app.post("/print")
-async def print_label(
+async def print_label_endpoint(
     part_number: str = Form(...),
     serial_number: str = Form(""),
     part_name: str = Form(""),
 ):
     """
     Tablet calls this when the operator taps Print. Generates a label
-    (barcode + text) and sends it straight to whatever Windows printer is
-    configured on this PC (e.g. a USB-connected Brother printer that's
-    already installed as a normal Windows printer).
+    (barcode + text) and sends it through the normal Windows print system
+    to whatever printer is configured (confirmed working: Brother QL-800).
     """
     try:
-        label = build_label_image(part_number, serial_number, part_name)
-        print_label_image(label)
+        print_label(part_number, serial_number, part_name)
         print(f"[✓] Printed label: P/N={part_number!r} S/N={serial_number!r}")
         return {"status": "printed"}
     except Exception as e:

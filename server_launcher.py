@@ -66,7 +66,7 @@ TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 # changes. Machines that already ran setup under an older version will
 # automatically redo just the pip-install steps (not the ~100MB Python
 # download) instead of silently keeping stale/missing packages.
-SETUP_VERSION = "7"
+SETUP_VERSION = "8"
 
 DEFAULT_PORT = 8000
 
