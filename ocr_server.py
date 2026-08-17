@@ -144,7 +144,7 @@ app.add_middleware(
 async def verify_api_key(request: Request, call_next):
     """Reject any request that doesn't carry the correct API key.
     /health is exempt so the settings screen can ping without a key."""
-    if request.method == "OPTIONS" or request.url.path in ("/health", "/"):
+    if request.method == "OPTIONS" or request.url.path in ("/health", "/", "/printer/usb-scan"):
         return await call_next(request)
     key = request.headers.get("X-API-Key", "")
     if key != API_KEY:
