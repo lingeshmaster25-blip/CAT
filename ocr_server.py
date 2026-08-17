@@ -257,7 +257,13 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, widt
     # widths just enough to break real barcode scanners. This renders each
     # bar at its correct pixel width directly, no interpolation involved.
     barcode_class = barcode.get_barcode_class("code128")
-    bc_opts = {"module_height": 15.0, "font_size": 0, "text_distance": 0, "quiet_zone": 1}
+    bc_opts = {
+        "module_width": 0.4,   # wider bars/gaps — the library's 0.2mm default was too thin for reliable thermal printing
+        "module_height": 15.0,
+        "font_size": 0,
+        "text_distance": 0,
+        "quiet_zone": 6.5,     # proper margin around the barcode — was incorrectly shrunk to 1mm
+    }
 
     max_w = int(width_px * (1 - 0.06 * 2))
     max_h = int(height_px * (1 - 0.06 * 2))
