@@ -31,24 +31,41 @@ from qwen_vl_utils import process_vision_info
 
 import barcode
 from barcode.writer import ImageWriter
-import win32print
-import win32ui
-from PIL import ImageWin
+from brother_ql.raster import BrotherQLRaster
+from brother_ql.conversion import convert as ql_convert
+from brother_ql.backends.helpers import send as ql_send, discover as ql_discover
 
 # ── API Key ───────────────────────────────────────────────────────────────────
 # Change this to any secret string — must match the key baked into the app
 API_KEY = "EZI-TRILO-OCR-2025"
 
-# ── Printer configuration ────────────────────────────────────────────────────
-# Same persistent-data convention as everything else here. If printer_name
-# is blank, prints go to whatever Windows currently has set as the default
-# printer. Set it explicitly (exact name as shown in Windows "Devices and
-# Printers") if this PC has more than one printer installed.
+# ── Printer configuration (Brother QL-800, direct USB, no Windows driver) ───
+# QL-800 does NOT print through the normal Windows printer queue on this
+# setup (confirmed — it only works via P-touch Editor Lite's own protocol).
+# brother_ql talks to it directly over USB instead, bypassing both Windows
+# printing and P-touch Editor entirely. This requires a one-time driver
+# swap on the PC — see README notes near the bottom of this file.
 PRINT_CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "printer.json"
 
-# Label size in mm — adjust to match your actual label stock.
-LABEL_WIDTH_MM = 62
-LABEL_HEIGHT_MM = 29
+QL_MODEL = "QL-800"
+# DK-1201 die-cut label (29mm x 90mm) — matches the size shown selected in
+# P-touch Editor. Change if you're using different label stock.
+QL_LABEL_SIZE = "29x90"
+# Brother QL-800's USB Vendor:Product ID. Used as the default guess before
+# falling back to discovery if this doesn't match what's connected.
+QL_DEFAULT_IDENTIFIER = "usb://0x04f9:0x209b"
+
+from brother_ql.devicedependent import label_type_specs as ql_label_specs
+
+# Printable area for QL_LABEL_SIZE, in the printer's native (portrait)
+# orientation: (width_across_tape_px, length_along_feed_px) = (306, 991)
+# for 29x90 die-cut. Die-cut labels require an EXACT pixel match — unlike
+# endless labels, brother_ql does not resize them to fit, it raises a hard
+# error on mismatch. Building our landscape design at exactly
+# (length_px, width_px) and passing rotate="auto" lets brother_ql detect
+# the swapped dimensions and rotate it into the native orientation itself.
+_QL_DOTS_PRINTABLE = ql_label_specs[QL_LABEL_SIZE]["dots_printable"]  # (306, 991)
+LABEL_IMAGE_SIZE_PX = (_QL_DOTS_PRINTABLE[1], _QL_DOTS_PRINTABLE[0])   # (991, 306) landscape
 
 # ── Shape library storage ────────────────────────────────────────────────────
 # Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
@@ -220,25 +237,23 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot  # both vectors are already L2-normalized, so dot == cosine sim
 
 
-def load_printer_name() -> str:
+def load_printer_identifier() -> str:
     try:
-        return json.loads(PRINT_CONFIG_FILE.read_text()).get("printer_name", "")
+        return json.loads(PRINT_CONFIG_FILE.read_text()).get("printer_identifier", "") or QL_DEFAULT_IDENTIFIER
     except Exception:
-        return ""
+        return QL_DEFAULT_IDENTIFIER
 
 
-def build_label_image(part_number: str, serial_number: str, part_name: str, dpi: int = 300) -> Image.Image:
+def build_label_image(part_number: str, serial_number: str, part_name: str) -> Image.Image:
     """
-    Render a label as a PIL image: barcode (Code128, of the part number —
-    falls back to serial number if part number isn't Code128-safe) plus
-    human-readable text underneath.
+    Render a label as a PIL image at EXACTLY the pixel size brother_ql
+    requires for QL_LABEL_SIZE (see LABEL_IMAGE_SIZE_PX above) — die-cut
+    labels are rejected outright if the size doesn't match precisely.
+    Barcode (Code128) on the left, human-readable text on the right.
     """
-    width_px = int(LABEL_WIDTH_MM / 25.4 * dpi)
-    height_px = int(LABEL_HEIGHT_MM / 25.4 * dpi)
+    width_px, height_px = LABEL_IMAGE_SIZE_PX
     label = Image.new("RGB", (width_px, height_px), "white")
 
-    # Barcode: Code128 handles any ASCII, so this should work for real-world
-    # part numbers even with letters/dashes.
     code_value = part_number or serial_number or "UNKNOWN"
     barcode_class = barcode.get_barcode_class("code128")
     bc = barcode_class(code_value, writer=ImageWriter())
@@ -249,55 +264,74 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, dpi:
         "quiet_zone": 1,
     })
 
-    # Fit the barcode into the top ~65% of the label, keeping aspect ratio.
-    bc_area_h = int(height_px * 0.62)
-    scale = min(width_px / bc_img.width, bc_area_h / bc_img.height)
+    # Fit the barcode into the left ~55% of the label, keeping aspect ratio.
+    bc_area_w = int(width_px * 0.55)
+    scale = min(bc_area_w / bc_img.width, height_px * 0.85 / bc_img.height)
     bc_resized = bc_img.resize((int(bc_img.width * scale), int(bc_img.height * scale)))
-    label.paste(bc_resized, ((width_px - bc_resized.width) // 2, 4))
+    label.paste(bc_resized, (10, (height_px - bc_resized.height) // 2))
 
-    # Human-readable text below the barcode.
+    # Human-readable text to the right of the barcode.
     draw = ImageDraw.Draw(label)
     try:
-        font = ImageFont.truetype("arial.ttf", size=int(height_px * 0.09))
-        font_small = ImageFont.truetype("arial.ttf", size=int(height_px * 0.065))
+        font = ImageFont.truetype("arial.ttf", size=int(height_px * 0.16))
+        font_small = ImageFont.truetype("arial.ttf", size=int(height_px * 0.12))
     except Exception:
         font = ImageFont.load_default()
         font_small = font
 
-    y = bc_area_h + 8
+    text_x = bc_area_w + 20
+    y = int(height_px * 0.15)
     lines = [f"P/N: {part_number}"]
     if serial_number:
         lines.append(f"S/N: {serial_number}")
     if part_name:
-        lines.append(part_name[:40])
+        lines.append(part_name[:30])
 
     for i, line in enumerate(lines):
         f = font if i == 0 else font_small
-        draw.text((width_px // 2, y), line, fill="black", font=f, anchor="ma")
-        y += int(height_px * 0.10)
+        draw.text((text_x, y), line, fill="black", font=f)
+        y += int(height_px * 0.28)
 
     return label
 
 
 def print_label_image(label: Image.Image) -> None:
-    """Send a label image to the configured (or default) Windows printer."""
-    printer_name = load_printer_name() or win32print.GetDefaultPrinter()
+    """Send a label image straight to the QL-800 over USB via brother_ql —
+    no Windows print driver or P-touch Editor involved."""
+    identifier = load_printer_identifier()
 
-    hDC = win32ui.CreateDC()
-    hDC.CreatePrinterDC(printer_name)
-    hDC.StartDoc("EZI Label")
-    hDC.StartPage()
+    qlr = BrotherQLRaster(QL_MODEL)
+    qlr.exception_on_warning = True
+    instructions = ql_convert(
+        qlr=qlr,
+        images=[label],
+        label=QL_LABEL_SIZE,
+        rotate="auto",
+        threshold=70.0,
+        dither=False,
+        compress=False,
+        red=False,
+        dpi_600=False,
+        hq=True,
+        cut=True,
+    )
 
-    # HORZRES=8, VERTRES=10 — standard Windows GDI DeviceCaps indices for
-    # the printable area in pixels at the printer's current resolution.
-    printable_w = hDC.GetDeviceCaps(8)
-    printable_h = hDC.GetDeviceCaps(10)
-    dib = ImageWin.Dib(label)
-    dib.draw(hDC.GetHandleOutput(), (0, 0, printable_w, printable_h))
-
-    hDC.EndPage()
-    hDC.EndDoc()
-    hDC.DeleteDC()
+    try:
+        ql_send(instructions=instructions, printer_identifier=identifier, backend_identifier="pyusb", blocking=True)
+    except Exception as first_error:
+        # The configured/default identifier didn't work — try discovering
+        # what's actually connected and retry once with that instead.
+        found = ql_discover(backend_identifier="pyusb")
+        if not found:
+            raise RuntimeError(
+                f"Couldn't reach the printer at {identifier!r}, and no QL printers were "
+                f"discovered on USB. Original error: {first_error}"
+            )
+        actual_identifier = found[0]["identifier"]
+        ql_send(instructions=instructions, printer_identifier=actual_identifier, backend_identifier="pyusb", blocking=True)
+        # Remember the identifier that actually worked for next time.
+        PRINT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PRINT_CONFIG_FILE.write_text(json.dumps({"printer_identifier": actual_identifier}))
     if not SHAPE_INDEX_FILE.exists():
         return []
     try:
@@ -314,23 +348,26 @@ def save_shape_library(entries: list[dict]) -> None:
 
 @app.get("/printer")
 async def get_printer_config():
-    """List installed Windows printers and show which one is currently configured."""
+    """Show the configured printer identifier and what's actually discoverable on USB right now."""
     try:
-        printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+        found = ql_discover(backend_identifier="pyusb")
     except Exception as e:
-        printers = []
+        found = []
+        discover_error = str(e)
+    else:
+        discover_error = None
     return {
-        "configured": load_printer_name(),
-        "windows_default": win32print.GetDefaultPrinter(),
-        "available": printers,
+        "configured": load_printer_identifier(),
+        "discovered": found,
+        "discover_error": discover_error,
     }
 
 
 @app.post("/printer")
-async def set_printer_config(printer_name: str = Form(...)):
+async def set_printer_config(printer_identifier: str = Form(...)):
     PRINT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PRINT_CONFIG_FILE.write_text(json.dumps({"printer_name": printer_name}))
-    return {"printer_name": printer_name}
+    PRINT_CONFIG_FILE.write_text(json.dumps({"printer_identifier": printer_identifier}))
+    return {"printer_identifier": printer_identifier}
 
 
 @app.post("/print")
