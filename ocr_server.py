@@ -235,51 +235,85 @@ def load_printer_name() -> str:
 
 def build_label_image(part_number: str, serial_number: str, part_name: str, width_px: int, height_px: int) -> Image.Image:
     """
-    Render a label as just a barcode (Code128), scaled to fill as much of
-    the label as possible, centered. part_name is accepted for signature
-    compatibility with the caller but no longer used — text was dropped
-    per request, barcode only.
+    Render a label as just a barcode (Code128), with its module width
+    computed directly from the label's real physical size (LABEL_WIDTH_MM x
+    LABEL_HEIGHT_MM) and the printer's actual operating resolution — not an
+    abstract pixel-fitting calculation. This stretches bars/gaps to use as
+    much of the real 29mm x 90mm label as the barcode's content allows,
+    rather than an arbitrary fixed module width.
+
+    part_name is accepted for signature compatibility with the caller but
+    no longer used — text was dropped per request, barcode only.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
 
-    # Encode both numbers in the barcode when both exist, not just the part
-    # number — a scanner reading this barcode later should get the full
-    # picture, not just half of it.
     if part_number and serial_number:
         code_value = f"{part_number}|{serial_number}"
     else:
         code_value = part_number or serial_number or "UNKNOWN"
 
-    # Render the barcode natively at (very close to) its final size by
-    # computing the DPI needed, rather than rendering small and resizing up
-    # — any resize/interpolation step blends adjacent black/white pixels at
-    # bar edges, which is invisible on screen but shifts effective bar
-    # widths just enough to break real barcode scanners. This renders each
-    # bar at its correct pixel width directly, no interpolation involved.
     barcode_class = barcode.get_barcode_class("code128")
-    bc_opts = {
-        "module_width": 0.4,   # wider bars/gaps — the library's 0.2mm default was too thin for reliable thermal printing
+    quiet_zone_mm = 4.0
+    margin_mm = 3.0  # extra breathing room beyond the barcode's own quiet zone
+
+    # The printer's ACTUAL operating resolution, derived from what it just
+    # told us (width_px/height_px via GetDeviceCaps) against the real
+    # physical label size — not assumed. Match the larger pixel dimension
+    # to the label's longer physical side, whichever way it's oriented.
+    long_side_px = max(width_px, height_px)
+    long_side_mm = max(LABEL_WIDTH_MM, LABEL_HEIGHT_MM)
+    actual_dpi = max(72, round(long_side_px / (long_side_mm / 25.4)))
+
+    # Learn how many "module units" this specific content needs by
+    # rendering once at a reference module width (scales linearly; quiet
+    # zone doesn't, so it's subtracted out).
+    ref_module_width = 1.0
+    ref_bc = barcode_class(code_value, writer=ImageWriter(dpi=actual_dpi))
+    ref_opts = {
+        "module_width": ref_module_width,
         "module_height": 15.0,
         "font_size": 0,
         "text_distance": 0,
-        "quiet_zone": 6.5,     # proper margin around the barcode — was incorrectly shrunk to 1mm
+        "quiet_zone": quiet_zone_mm,
     }
+    ref_img = ref_bc.render(writer_options=ref_opts)
+    ref_total_width_mm = ref_img.width / actual_dpi * 25.4
+    data_modules = (ref_total_width_mm - 2 * quiet_zone_mm) / ref_module_width
 
-    max_w = int(width_px * (1 - 0.06 * 2))
-    max_h = int(height_px * (1 - 0.06 * 2))
+    # Solve for the module width that makes the barcode fill the label's
+    # long dimension (minus margins), given this content's actual module count.
+    target_total_mm = long_side_mm - 2 * margin_mm
+    ideal_module_width = (target_total_mm - 2 * quiet_zone_mm) / data_modules
+    ideal_module_width = max(0.2, ideal_module_width)  # never thinner than the library's own safe default
 
-    ref_dpi = 300
-    ref_bc = barcode_class(code_value, writer=ImageWriter(dpi=ref_dpi))
-    ref_img = ref_bc.render(writer_options=bc_opts)
+    final_bc = barcode_class(code_value, writer=ImageWriter(dpi=actual_dpi))
+    final_opts = {
+        "module_width": ideal_module_width,
+        "module_height": 15.0,
+        "font_size": 0,
+        "text_distance": 0,
+        "quiet_zone": quiet_zone_mm,
+    }
+    bc_final = final_bc.render(writer_options=final_opts)
 
-    scale_needed = min(max_w / ref_img.width, max_h / ref_img.height)
-    final_dpi = max(72, int(ref_dpi * scale_needed))
+    # bc_final was sized to match the label's LONG dimension along its own
+    # width (bars run horizontally). If the canvas itself is portrait
+    # (taller than wide), rotate so the barcode's long axis lines up with
+    # the canvas's long axis (height) instead of getting squeezed into the
+    # short one.
+    canvas_is_portrait = height_px > width_px
+    if canvas_is_portrait:
+        bc_final = bc_final.rotate(90, expand=True)
 
-    if final_dpi == ref_dpi:
-        bc_final = ref_img
-    else:
-        bc = barcode_class(code_value, writer=ImageWriter(dpi=final_dpi))
-        bc_final = bc.render(writer_options=bc_opts)
+    # Rendered directly at the printer's real resolution and the label's
+    # real physical size — should already fit without further scaling.
+    # Clamp defensively in case of rounding, but this should be a no-op.
+    if bc_final.width > width_px or bc_final.height > height_px:
+        shrink = min(width_px / bc_final.width, height_px / bc_final.height)
+        bc_final = bc_final.resize(
+            (max(1, int(bc_final.width * shrink)), max(1, int(bc_final.height * shrink))),
+            Image.NEAREST,
+        )
 
     x = (width_px - bc_final.width) // 2
     y = (height_px - bc_final.height) // 2
@@ -365,7 +399,16 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     except Exception as e:
         print(f"[!] Couldn't save label preview: {e}")
 
-    dib = ImageWin.Dib(label)
+    # Explicitly convert to pure 1-bit black/white with NO dithering before
+    # handing off to GDI. Everything drawn in build_label_image() is
+    # already solid black or white (no anti-aliasing), so this conversion
+    # is lossless — but it also means Windows' driver has no ambiguous
+    # grayscale/color content left to dither on its own. Some label
+    # printer drivers apply automatic dithering when converting color/gray
+    # images down to 1-bit for the thermal head, which would corrupt sharp
+    # barcode edges even though the source image is already clean.
+    label_bw = label.convert("1", dither=Image.NONE)
+    dib = ImageWin.Dib(label_bw)
     dib.draw(hDC.GetHandleOutput(), (0, 0, printable_w, printable_h))
 
     hDC.EndPage()
