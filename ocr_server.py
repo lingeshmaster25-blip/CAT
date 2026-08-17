@@ -227,19 +227,12 @@ def load_printer_name() -> str:
 
 def build_label_image(part_number: str, serial_number: str, part_name: str, width_px: int, height_px: int) -> Image.Image:
     """
-    Render a label as a PIL image sized to exactly the printable area the
-    printer driver reports (passed in from print_label(), via GDI
-    DeviceCaps) — Windows/the driver handles fitting this to the actual
-    label stock configured in the printer's properties.
-
-    Adapts layout to whatever orientation is actually reported: landscape
-    (wider than tall) puts the barcode left / text right; portrait (taller
-    than wide) stacks barcode on top of text instead. Assuming landscape
-    unconditionally produced a badly squeezed, nearly-blank result when the
-    printer's current orientation setting was actually Portrait.
+    Render a label as just a barcode (Code128), scaled to fill as much of
+    the label as possible, centered. part_name is accepted for signature
+    compatibility with the caller but no longer used — text was dropped
+    per request, barcode only.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
-    landscape = width_px >= height_px
 
     # Encode both numbers in the barcode when both exist, not just the part
     # number — a scanner reading this barcode later should get the full
@@ -248,54 +241,26 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, widt
         code_value = f"{part_number}|{serial_number}"
     else:
         code_value = part_number or serial_number or "UNKNOWN"
+
     barcode_class = barcode.get_barcode_class("code128")
     bc = barcode_class(code_value, writer=ImageWriter())
     bc_img = bc.render(writer_options={
-        "module_height": 8.0,
-        "font_size": 0,       # we draw our own text, not the writer's
+        "module_height": 15.0,
+        "font_size": 0,
         "text_distance": 0,
         "quiet_zone": 1,
     })
 
-    draw = ImageDraw.Draw(label)
-    try:
-        font = ImageFont.truetype("arial.ttf", size=int(min(width_px, height_px) * 0.09))
-        font_small = ImageFont.truetype("arial.ttf", size=int(min(width_px, height_px) * 0.065))
-    except Exception:
-        font = ImageFont.load_default()
-        font_small = font
+    # Fill the label with a small margin, keeping aspect ratio, centered.
+    margin = 0.06
+    max_w = int(width_px * (1 - margin * 2))
+    max_h = int(height_px * (1 - margin * 2))
+    scale = min(max_w / bc_img.width, max_h / bc_img.height)
+    bc_resized = bc_img.resize((max(1, int(bc_img.width * scale)), max(1, int(bc_img.height * scale))))
 
-    lines = [f"P/N: {part_number}"]
-    if serial_number:
-        lines.append(f"S/N: {serial_number}")
-    if part_name:
-        lines.append(part_name[:30])
-
-    if landscape:
-        # Barcode on the left, text to the right.
-        bc_area_w = int(width_px * 0.55)
-        scale = min(bc_area_w / bc_img.width, height_px * 0.85 / bc_img.height)
-        bc_resized = bc_img.resize((max(1, int(bc_img.width * scale)), max(1, int(bc_img.height * scale))))
-        label.paste(bc_resized, (10, (height_px - bc_resized.height) // 2))
-
-        text_x = bc_area_w + 20
-        y = int(height_px * 0.15)
-        for i, line in enumerate(lines):
-            f = font if i == 0 else font_small
-            draw.text((text_x, y), line, fill="black", font=f)
-            y += int(height_px * 0.28)
-    else:
-        # Barcode on top, text stacked below — fits a tall/narrow canvas.
-        bc_area_h = int(height_px * 0.5)
-        scale = min(width_px * 0.9 / bc_img.width, bc_area_h / bc_img.height)
-        bc_resized = bc_img.resize((max(1, int(bc_img.width * scale)), max(1, int(bc_img.height * scale))))
-        label.paste(bc_resized, ((width_px - bc_resized.width) // 2, 10))
-
-        y = bc_area_h + 20
-        for i, line in enumerate(lines):
-            f = font if i == 0 else font_small
-            draw.text((width_px // 2, y), line, fill="black", font=f, anchor="ma")
-            y += int(height_px * 0.09)
+    x = (width_px - bc_resized.width) // 2
+    y = (height_px - bc_resized.height) // 2
+    label.paste(bc_resized, (x, y))
 
     return label
 
