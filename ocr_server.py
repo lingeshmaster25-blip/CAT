@@ -14,20 +14,61 @@ Run:
 """
 
 import io
+import json
+import os
 import re
+import uuid
+from pathlib import Path
+
 import torch
 import uvicorn
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from PIL import Image
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from fastapi.responses import HTMLResponse, JSONResponse
+from PIL import Image, ImageDraw, ImageFont
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, CLIPModel, CLIPProcessor
 from qwen_vl_utils import process_vision_info
 
-# ── Load Model ────────────────────────────────────────────────────────────────
+import barcode
+from barcode.writer import ImageWriter
+import win32print
+import win32ui
+from PIL import ImageWin
+
+# ── API Key ───────────────────────────────────────────────────────────────────
+# Change this to any secret string — must match the key baked into the app
+API_KEY = "EZI-TRILO-OCR-2025"
+
+# ── Printer configuration ────────────────────────────────────────────────────
+# Same persistent-data convention as everything else here. If printer_name
+# is blank, prints go to whatever Windows currently has set as the default
+# printer. Set it explicitly (exact name as shown in Windows "Devices and
+# Printers") if this PC has more than one printer installed.
+PRINT_CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "printer.json"
+
+# Label size in mm — adjust to match your actual label stock.
+LABEL_WIDTH_MM = 62
+LABEL_HEIGHT_MM = 29
+
+# ── Shape library storage ────────────────────────────────────────────────────
+# Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
+# Server\) so reference photos/embeddings survive reinstalling the app.
+SHAPE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "shape_library"
+SHAPE_IMAGES_DIR = SHAPE_DIR / "images"
+SHAPE_INDEX_FILE = SHAPE_DIR / "index.json"
+SHAPE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+# Cosine similarity below this is treated as "no confident match" rather than
+# guessing. This is a starting point — tune it against your real parts once
+# you have a working reference library; too low and unrelated parts will
+# match each other, too high and legitimate matches get rejected.
+SHAPE_MATCH_THRESHOLD = 0.80
+
+# ── Load Models ───────────────────────────────────────────────────────────────
 device = "cuda"
 torch_dtype = torch.float16
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
 
 print("=" * 60)
 print("   LOADING QWEN2-VL-2B INTO GPU VRAM — EZI OCR SERVER")
@@ -37,7 +78,14 @@ model = Qwen2VLForConditionalGeneration.from_pretrained(
     MODEL_ID, torch_dtype=torch_dtype, device_map="auto"
 )
 processor = AutoProcessor.from_pretrained(MODEL_ID)
-print("[✓] Model loaded and ready.\n")
+print("[✓] OCR model loaded and ready.\n")
+
+print("=" * 60)
+print("   LOADING CLIP INTO GPU VRAM — SHAPE RECOGNITION")
+print("=" * 60)
+clip_model = CLIPModel.from_pretrained(CLIP_MODEL_ID, torch_dtype=torch_dtype).to(device)
+clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_ID)
+print("[✓] Shape-recognition model loaded and ready.\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -50,6 +98,18 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def verify_api_key(request: Request, call_next):
+    """Reject any request that doesn't carry the correct API key.
+    /health is exempt so the settings screen can ping without a key."""
+    if request.method == "OPTIONS" or request.url.path in ("/health", "/"):
+        return await call_next(request)
+    key = request.headers.get("X-API-Key", "")
+    if key != API_KEY:
+        print(f"[!] Unauthorized request from {request.client.host} — key: {key!r}")
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 def run_model(pil_image: Image.Image) -> str:
@@ -142,7 +202,158 @@ def parse_output(raw: str) -> dict:
     return {"serial": serial, "part": part, "confidence": confidence}
 
 
+# ── Shape recognition (CLIP embeddings + cosine similarity) ─────────────────
+
+def compute_shape_embedding(pil_image: Image.Image) -> list[float]:
+    """Return a normalized CLIP image embedding as a plain Python list
+    (JSON-serializable, easy to store alongside the reference library)."""
+    inputs = clip_processor(images=pil_image, return_tensors="pt").to(device)
+    inputs["pixel_values"] = inputs["pixel_values"].to(torch_dtype)
+    with torch.no_grad():
+        features = clip_model.get_image_features(**inputs)
+        features = features / features.norm(p=2, dim=-1, keepdim=True)
+    return features[0].float().cpu().tolist()
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    return dot  # both vectors are already L2-normalized, so dot == cosine sim
+
+
+def load_printer_name() -> str:
+    try:
+        return json.loads(PRINT_CONFIG_FILE.read_text()).get("printer_name", "")
+    except Exception:
+        return ""
+
+
+def build_label_image(part_number: str, serial_number: str, part_name: str, dpi: int = 300) -> Image.Image:
+    """
+    Render a label as a PIL image: barcode (Code128, of the part number —
+    falls back to serial number if part number isn't Code128-safe) plus
+    human-readable text underneath.
+    """
+    width_px = int(LABEL_WIDTH_MM / 25.4 * dpi)
+    height_px = int(LABEL_HEIGHT_MM / 25.4 * dpi)
+    label = Image.new("RGB", (width_px, height_px), "white")
+
+    # Barcode: Code128 handles any ASCII, so this should work for real-world
+    # part numbers even with letters/dashes.
+    code_value = part_number or serial_number or "UNKNOWN"
+    barcode_class = barcode.get_barcode_class("code128")
+    bc = barcode_class(code_value, writer=ImageWriter())
+    bc_img = bc.render(writer_options={
+        "module_height": 8.0,
+        "font_size": 0,       # we draw our own text below, not the writer's
+        "text_distance": 0,
+        "quiet_zone": 1,
+    })
+
+    # Fit the barcode into the top ~65% of the label, keeping aspect ratio.
+    bc_area_h = int(height_px * 0.62)
+    scale = min(width_px / bc_img.width, bc_area_h / bc_img.height)
+    bc_resized = bc_img.resize((int(bc_img.width * scale), int(bc_img.height * scale)))
+    label.paste(bc_resized, ((width_px - bc_resized.width) // 2, 4))
+
+    # Human-readable text below the barcode.
+    draw = ImageDraw.Draw(label)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=int(height_px * 0.09))
+        font_small = ImageFont.truetype("arial.ttf", size=int(height_px * 0.065))
+    except Exception:
+        font = ImageFont.load_default()
+        font_small = font
+
+    y = bc_area_h + 8
+    lines = [f"P/N: {part_number}"]
+    if serial_number:
+        lines.append(f"S/N: {serial_number}")
+    if part_name:
+        lines.append(part_name[:40])
+
+    for i, line in enumerate(lines):
+        f = font if i == 0 else font_small
+        draw.text((width_px // 2, y), line, fill="black", font=f, anchor="ma")
+        y += int(height_px * 0.10)
+
+    return label
+
+
+def print_label_image(label: Image.Image) -> None:
+    """Send a label image to the configured (or default) Windows printer."""
+    printer_name = load_printer_name() or win32print.GetDefaultPrinter()
+
+    hDC = win32ui.CreateDC()
+    hDC.CreatePrinterDC(printer_name)
+    hDC.StartDoc("EZI Label")
+    hDC.StartPage()
+
+    # HORZRES=8, VERTRES=10 — standard Windows GDI DeviceCaps indices for
+    # the printable area in pixels at the printer's current resolution.
+    printable_w = hDC.GetDeviceCaps(8)
+    printable_h = hDC.GetDeviceCaps(10)
+    dib = ImageWin.Dib(label)
+    dib.draw(hDC.GetHandleOutput(), (0, 0, printable_w, printable_h))
+
+    hDC.EndPage()
+    hDC.EndDoc()
+    hDC.DeleteDC()
+    if not SHAPE_INDEX_FILE.exists():
+        return []
+    try:
+        return json.loads(SHAPE_INDEX_FILE.read_text())
+    except Exception:
+        return []
+
+
+def save_shape_library(entries: list[dict]) -> None:
+    SHAPE_INDEX_FILE.write_text(json.dumps(entries))
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/printer")
+async def get_printer_config():
+    """List installed Windows printers and show which one is currently configured."""
+    try:
+        printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS)]
+    except Exception as e:
+        printers = []
+    return {
+        "configured": load_printer_name(),
+        "windows_default": win32print.GetDefaultPrinter(),
+        "available": printers,
+    }
+
+
+@app.post("/printer")
+async def set_printer_config(printer_name: str = Form(...)):
+    PRINT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PRINT_CONFIG_FILE.write_text(json.dumps({"printer_name": printer_name}))
+    return {"printer_name": printer_name}
+
+
+@app.post("/print")
+async def print_label(
+    part_number: str = Form(...),
+    serial_number: str = Form(""),
+    part_name: str = Form(""),
+):
+    """
+    Tablet calls this when the operator taps Print. Generates a label
+    (barcode + text) and sends it straight to whatever Windows printer is
+    configured on this PC (e.g. a USB-connected Brother printer that's
+    already installed as a normal Windows printer).
+    """
+    try:
+        label = build_label_image(part_number, serial_number, part_name)
+        print_label_image(label)
+        print(f"[✓] Printed label: P/N={part_number!r} S/N={serial_number!r}")
+        return {"status": "printed"}
+    except Exception as e:
+        print(f"[!] Print failed: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
 
 @app.get("/health")
 async def health():
@@ -228,9 +439,92 @@ async def scan_legacy(file: UploadFile = File(...)):
     }
 
 
+# ── Shape recognition endpoints ─────────────────────────────────────────────
+
+@app.post("/shapes/register")
+async def register_shape(part_number: str = Form(...), image: UploadFile = File(...)):
+    """
+    Admin panel calls this to add a reference photo for a part number.
+    Multiple photos can be registered for the same part_number (e.g. from a
+    couple of angles) — identification matches against all of them and takes
+    the best score.
+    """
+    image_bytes = await image.read()
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    entry_id = uuid.uuid4().hex
+    image_path = SHAPE_IMAGES_DIR / f"{entry_id}.jpg"
+    pil_image.save(image_path, "JPEG", quality=90)
+
+    embedding = compute_shape_embedding(pil_image)
+
+    library = load_shape_library()
+    library.append({
+        "id": entry_id,
+        "part_number": part_number.strip().upper(),
+        "embedding": embedding,
+    })
+    save_shape_library(library)
+
+    print(f"[✓] Registered shape reference for part {part_number!r} (id={entry_id})")
+    return {"id": entry_id, "part_number": part_number.strip().upper()}
+
+
+@app.post("/shapes/identify")
+async def identify_shape(image: UploadFile = File(...)):
+    """
+    Tablet calls this with a photo of an unidentified small part.
+    Returns the best-matching part_number and its similarity score, or
+    part_number: null if nothing in the library is a confident enough match.
+    """
+    image_bytes = await image.read()
+    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    query_embedding = compute_shape_embedding(pil_image)
+
+    library = load_shape_library()
+    if not library:
+        return {"part_number": None, "confidence": 0.0, "reason": "No reference shapes registered yet."}
+
+    scored = sorted(
+        (
+            {"part_number": entry["part_number"], "score": cosine_similarity(query_embedding, entry["embedding"])}
+            for entry in library
+        ),
+        key=lambda r: r["score"],
+        reverse=True,
+    )
+    best = scored[0]
+    print(f"[shape] best match {best['part_number']!r} score={best['score']:.3f} (threshold {SHAPE_MATCH_THRESHOLD})")
+
+    if best["score"] < SHAPE_MATCH_THRESHOLD:
+        return {"part_number": None, "confidence": round(best["score"], 3), "reason": "No confident match."}
+
+    return {"part_number": best["part_number"], "confidence": round(best["score"], 3)}
+
+
+@app.get("/shapes")
+async def list_shapes():
+    """Admin panel calls this to show what's registered, grouped by part number."""
+    library = load_shape_library()
+    grouped: dict[str, list[str]] = {}
+    for entry in library:
+        grouped.setdefault(entry["part_number"], []).append(entry["id"])
+    return {"parts": [{"part_number": pn, "reference_ids": ids} for pn, ids in grouped.items()]}
+
+
+@app.delete("/shapes/{entry_id}")
+async def delete_shape(entry_id: str):
+    library = load_shape_library()
+    remaining = [e for e in library if e["id"] != entry_id]
+    if len(remaining) == len(library):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    save_shape_library(remaining)
+    image_path = SHAPE_IMAGES_DIR / f"{entry_id}.jpg"
+    image_path.unlink(missing_ok=True)
+    return {"deleted": entry_id}
+
+
 if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("EZI_OCR_PORT", "8000"))
-    print(f"[*] Server starting on http://0.0.0.0:{port}")
-    print(f"[*] EZI app: tap ⚙ gear → enter http://<THIS-MACHINE-IP>:{port}\n")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print("[*] Server starting on http://0.0.0.0:8000")
+    print("[*] EZI app: tap ⚙ gear → enter http://<THIS-MACHINE-IP>:8000\n")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

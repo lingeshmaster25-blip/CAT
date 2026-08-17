@@ -1,6 +1,6 @@
-# Installed into the app's private python_env on first run.
-# torch is installed separately (see server_launcher.py) with the CUDA
-# wheel index, since the plain PyPI build is CPU-only on Windows.
+# Installed into the app's private python_env on first run (see
+# server_launcher.py). torch/torchvision are installed separately there
+# with the CUDA wheel index — not listed here.
 fastapi
 uvicorn[standard]
 python-multipart
@@ -8,3 +8,8 @@ pillow
 transformers>=4.45
 accelerate
 qwen-vl-utils
+
+# Label printing (Windows only — sends generated label images to whatever
+# printer is installed in Windows, e.g. a USB-connected Brother printer)
+pywin32
+python-barcode
