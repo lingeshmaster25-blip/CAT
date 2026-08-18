@@ -235,18 +235,24 @@ def load_printer_name() -> str:
         return DEFAULT_PRINTER_NAME
 
 
-GAP_BETWEEN_BARCODES_MM = 5.0
-
-
-def compute_barcode_pieces(part_number: str, serial_number: str) -> list[str]:
-    """Separate barcodes, serial number on top, part number below. If only
-    one is present (e.g. this part has no serial), returns just that one
-    piece — build_label_image() centers a single piece automatically."""
-    pieces = [v for v in (serial_number, part_number) if v]
-    return pieces or ["UNKNOWN"]
+def compute_barcode_pieces(part_number: str, serial_number: str) -> list[tuple[str, str]]:
+    """Separate barcodes as (label, value) pairs — serial number on top,
+    part number below. The barcode itself encodes just the raw value; the
+    label is only used for the human-readable caption. If only one is
+    present (e.g. this part has no serial), returns just that one piece —
+    build_label_image() centers a single piece automatically."""
+    pieces = []
+    if serial_number:
+        pieces.append(("Serial Number", serial_number))
+    if part_number:
+        pieces.append(("Part Number", part_number))
+    return pieces or [("Part Number", "UNKNOWN")]
 
 
 def _render_piece(value: str, dpi: float, module_width_mm: float, module_height_mm: float, quiet_zone_mm: float) -> Image.Image:
+    """Bars only, no baked-in text — text is added separately in
+    build_label_image() AFTER any rotation, so it always stays upright and
+    readable regardless of how the bars are oriented on the label."""
     barcode_class = barcode.get_barcode_class("code128")
     bc = barcode_class(value, writer=ImageWriter(dpi=dpi))
     opts = {
@@ -259,76 +265,93 @@ def _render_piece(value: str, dpi: float, module_width_mm: float, module_height_
     return bc.render(writer_options=opts)
 
 
-def build_label_image(pieces: list[str], width_px: int, height_px: int) -> Image.Image:
+def _compose_with_text(bars_img: Image.Image, caption_text: str, dpi: float, max_width_px: int) -> Image.Image:
+    """Stack upright, horizontal caption text below the (possibly
+    already-rotated) bars image. Always horizontal regardless of the bars'
+    own orientation — this is what keeps text readable after rotation.
+    Font size is scaled to fit max_width_px (the label's short/fixed
+    dimension) so longer captions don't overflow or get clipped."""
+    draw_tmp = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+    def measure(font_size: int):
+        try:
+            f = ImageFont.truetype("arial.ttf", size=font_size)
+        except Exception:
+            f = ImageFont.load_default()
+        bbox = draw_tmp.textbbox((0, 0), caption_text, font=f)
+        return f, bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    # Start from a reasonable size and scale down to fit if needed.
+    font_size = max(8, int(dpi * 24 / 72))
+    font, text_w, text_h = measure(font_size)
+    max_text_w = int(max_width_px * 0.92)
+    if text_w > max_text_w:
+        font_size = max(8, int(font_size * max_text_w / text_w))
+        font, text_w, text_h = measure(font_size)
+
+    text_margin = int(dpi * 3 / 25.4)  # ~3mm gap between bars and text
+    out_w = max(bars_img.width, text_w)
+    out_h = bars_img.height + text_margin + text_h + 4
+    out = Image.new("RGB", (out_w, out_h), "white")
+    out.paste(bars_img, ((out_w - bars_img.width) // 2, 0))
+
+    draw = ImageDraw.Draw(out)
+    draw.text(
+        (out_w // 2, bars_img.height + text_margin),
+        caption_text, fill="black", font=font, anchor="ma",
+    )
+    return out
+
+
+def build_label_image(pieces: list[tuple[str, str]], width_px: int, height_px: int) -> Image.Image:
     """
-    Render one or two barcodes (Code128), with module width SOLVED to
-    fill the label's fixed long dimension (die-cut stock — both width and
-    length are fixed: LABEL_WIDTH_MM x LABEL_HEIGHT_MM). Stacked with a
-    gap between them if there are two; a single piece is centered.
+    Landscape label — width_px is the long dimension (91.5mm, where the
+    bars run), height_px is the short dimension (62mm, split into equal
+    bands stacked top-to-bottom, one per piece: serial on top, part on
+    bottom). Bars are always drawn horizontally, never rotated, since the
+    canvas is wide enough on its own.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
     quiet_zone_mm = 4.0
-    margin_mm = 3.0
-    module_height_mm = 15.0
-
-    long_side_px = max(width_px, height_px)
-    long_side_mm = max(LABEL_WIDTH_MM, LABEL_HEIGHT_MM)
-    actual_dpi = max(72, round(long_side_px / (long_side_mm / 25.4)))
+    margin_mm = 4.0
+    module_height_mm = 12.0  # fits comfortably within a 31mm band with room left for text
 
     n = len(pieces)
-    gap_px = int(GAP_BETWEEN_BARCODES_MM / 25.4 * actual_dpi) if n > 1 else 0
-    gap_mm_total = GAP_BETWEEN_BARCODES_MM * (n - 1)
+    band_height_px = height_px // n
+    actual_dpi = max(72, round(width_px / (LABEL_HEIGHT_MM / 25.4)))
 
-    # Learn how many "module units" this content needs (summed across all
-    # pieces) by rendering once at a reference module width.
+    # Learn how many "module units" each piece needs, solve module width to
+    # fill the available width (long dimension) for each independently —
+    # unlike the stacked-along-one-axis case, each band has the FULL width
+    # available to itself, not a shared budget.
+    target_width_mm = LABEL_HEIGHT_MM - 2 * margin_mm
     ref_module_width = 1.0
-    total_ref_width_mm = 0.0
-    for value in pieces:
+
+    for i, (piece_label, value) in enumerate(pieces):
         ref_img = _render_piece(value, actual_dpi, ref_module_width, module_height_mm, quiet_zone_mm)
-        total_ref_width_mm += ref_img.width / actual_dpi * 25.4
-    total_data_modules = (total_ref_width_mm - 2 * quiet_zone_mm * n) / ref_module_width
+        ref_width_mm = ref_img.width / actual_dpi * 25.4
+        data_modules = (ref_width_mm - 2 * quiet_zone_mm) / ref_module_width
+        ideal_module_width = max(0.2, (target_width_mm - 2 * quiet_zone_mm) / data_modules)
 
-    # Solve for the module width that makes everything (all pieces + gaps)
-    # fill the label's long dimension, minus margins.
-    target_total_mm = long_side_mm - 2 * margin_mm - gap_mm_total
-    ideal_module_width = max(0.2, (target_total_mm - 2 * quiet_zone_mm * n) / total_data_modules)
-
-    canvas_is_portrait = height_px > width_px
-
-    rendered = []
-    for value in pieces:
         piece_img = _render_piece(value, actual_dpi, ideal_module_width, module_height_mm, quiet_zone_mm)
-        if canvas_is_portrait:
-            piece_img = piece_img.rotate(90, expand=True)
-        rendered.append(piece_img)
+        caption = piece_label
+        piece_img = _compose_with_text(piece_img, caption, actual_dpi, width_px)
 
-    # Total extent along the long axis, to center the whole stack.
-    long_axis = 1 if canvas_is_portrait else 0
-    short_axis = 0 if canvas_is_portrait else 1
-    total_long = sum(im.size[long_axis] for im in rendered) + gap_px * (len(rendered) - 1)
-    canvas_long = height_px if canvas_is_portrait else width_px
-    canvas_short = width_px if canvas_is_portrait else height_px
+        # Clamp defensively in case of rounding — target 96% of the band,
+        # not 100%, so nothing sits flush against the physical edge.
+        safe_band_h = int(band_height_px * 0.90)
+        safe_w = int(width_px * 0.94)
+        if piece_img.height > safe_band_h or piece_img.width > safe_w:
+            shrink = min(safe_band_h / piece_img.height, safe_w / piece_img.width)
+            piece_img = piece_img.resize(
+                (max(1, int(piece_img.width * shrink)), max(1, int(piece_img.height * shrink))),
+                Image.NEAREST,
+            )
 
-    # Should already fit closely — clamp defensively in case of rounding.
-    if total_long > canvas_long:
-        shrink = canvas_long / total_long
-        rendered = [
-            im.resize((max(1, int(im.width * shrink)), max(1, int(im.height * shrink))), Image.NEAREST)
-            for im in rendered
-        ]
-        total_long = sum(im.size[long_axis] for im in rendered) + int(gap_px * shrink) * (len(rendered) - 1)
-        gap_px = int(gap_px * shrink)
-
-    cursor = (canvas_long - total_long) // 2
-    for piece_img in rendered:
-        piece_short = piece_img.size[short_axis]
-        offset_short = (canvas_short - piece_short) // 2
-        if canvas_is_portrait:
-            pos = (offset_short, cursor)
-        else:
-            pos = (cursor, offset_short)
-        label.paste(piece_img, pos)
-        cursor += piece_img.size[long_axis] + gap_px
+        band_top = i * band_height_px
+        x = (width_px - piece_img.width) // 2
+        y = band_top + (band_height_px - piece_img.height) // 2
+        label.paste(piece_img, (x, y))
 
     return label
 
