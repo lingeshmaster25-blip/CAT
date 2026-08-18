@@ -343,7 +343,14 @@ def get_forced_label_devmode(printer_name: str, length_mm: float):
         devmode = properties["pDevMode"]
 
         # DEVMODE paper width/length are in tenths of a millimetre.
-        devmode.PaperSize = 0  # 0 = custom, use PaperWidth/PaperLength below
+        # PaperSize must be DMPAPER_USER (256) to tell the driver "use the
+        # custom PaperWidth/PaperLength below" — 0 is NOT the correct
+        # sentinel for this and likely caused the driver's validation step
+        # to snap back to the nearest REGISTERED form it knew about
+        # instead (e.g. an old "EZI Label" 29x90mm form from earlier
+        # testing), which is exactly the mismatch you saw.
+        DMPAPER_USER = getattr(win32con, "DMPAPER_USER", 256)
+        devmode.PaperSize = DMPAPER_USER
         devmode.PaperWidth = int(LABEL_WIDTH_MM * 10)
         devmode.PaperLength = int(length_mm * 10)
         devmode.Fields |= win32con.DM_PAPERSIZE | win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH
@@ -354,6 +361,11 @@ def get_forced_label_devmode(printer_name: str, length_mm: float):
         win32print.DocumentProperties(
             0, hPrinter, printer_name, devmode, devmode,
             win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+        )
+        print(
+            f"[i] After driver validation: PaperSize={devmode.PaperSize} "
+            f"PaperWidth={devmode.PaperWidth} (={devmode.PaperWidth/10}mm) "
+            f"PaperLength={devmode.PaperLength} (={devmode.PaperLength/10}mm)"
         )
         return devmode
     finally:
