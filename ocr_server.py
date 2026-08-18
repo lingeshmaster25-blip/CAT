@@ -49,12 +49,13 @@ API_KEY = "EZI-TRILO-OCR-2025"
 PRINT_CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "printer.json"
 DEFAULT_PRINTER_NAME = "Brother QL-800"
 
-# Physical label size — confirmed exact stock size, DK-1201 die-cut.
-# Explicitly forced via DEVMODE at print time (see set_label_devmode())
-# rather than trusting whatever the driver's ambient/last-used settings
-# happen to be, so this stays correct even if those settings ever change.
-LABEL_WIDTH_MM = 29
-LABEL_HEIGHT_MM = 90
+# Physical label stock — continuous roll, 62mm wide (fixed by the tape
+# itself). Unlike die-cut labels, continuous stock has no fixed length —
+# each print job's length is computed from how much the barcode content
+# actually needs, then forced via DEVMODE for that specific job.
+LABEL_WIDTH_MM = 62
+CONTINUOUS_MODULE_WIDTH_MM = 0.4  # solid, reliable bar width — length grows to fit rather than squeezing into a target
+CONTINUOUS_FEED_MARGIN_MM = 4.0   # blank margin before/after the barcode along the feed direction
 
 # ── Shape library storage ────────────────────────────────────────────────────
 # Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
@@ -233,81 +234,70 @@ def load_printer_name() -> str:
         return DEFAULT_PRINTER_NAME
 
 
-def build_label_image(part_number: str, serial_number: str, part_name: str, width_px: int, height_px: int) -> Image.Image:
-    """
-    Render a label as just a barcode (Code128), with its module width
-    computed directly from the label's real physical size (LABEL_WIDTH_MM x
-    LABEL_HEIGHT_MM) and the printer's actual operating resolution — not an
-    abstract pixel-fitting calculation. This stretches bars/gaps to use as
-    much of the real 29mm x 90mm label as the barcode's content allows,
-    rather than an arbitrary fixed module width.
+def compute_barcode_value(part_number: str, serial_number: str) -> str:
+    if part_number and serial_number:
+        return f"{part_number}|{serial_number}"
+    return part_number or serial_number or "UNKNOWN"
 
-    part_name is accepted for signature compatibility with the caller but
-    no longer used — text was dropped per request, barcode only.
+
+def compute_continuous_label_length_mm(code_value: str) -> float:
+    """
+    For continuous roll stock, there's no fixed length to fit — instead we
+    use a solid, reliable module width and let the length be however long
+    that naturally comes out to for this specific content.
+    """
+    barcode_class = barcode.get_barcode_class("code128")
+    module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)  # generous bar height within the tape width, leaving margin
+    bc = barcode_class(code_value, writer=ImageWriter(dpi=300))
+    opts = {
+        "module_width": CONTINUOUS_MODULE_WIDTH_MM,
+        "module_height": module_height_mm,
+        "font_size": 0,
+        "text_distance": 0,
+        "quiet_zone": 4.0,
+    }
+    img = bc.render(writer_options=opts)
+    content_length_mm = img.width / 300 * 25.4
+    return content_length_mm + 2 * CONTINUOUS_FEED_MARGIN_MM
+
+
+def build_label_image(code_value: str, width_px: int, height_px: int) -> Image.Image:
+    """
+    Render a label as just a barcode (Code128), using the solid module
+    width chosen for continuous roll stock (see compute_continuous_label_length_mm)
+    — the canvas here was already sized in print_label() to match what
+    this specific barcode needs, so this mostly just needs to render it
+    natively and center it, handling orientation.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
-
-    if part_number and serial_number:
-        code_value = f"{part_number}|{serial_number}"
-    else:
-        code_value = part_number or serial_number or "UNKNOWN"
-
     barcode_class = barcode.get_barcode_class("code128")
     quiet_zone_mm = 4.0
-    margin_mm = 3.0  # extra breathing room beyond the barcode's own quiet zone
+    module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)
 
-    # The printer's ACTUAL operating resolution, derived from what it just
-    # told us (width_px/height_px via GetDeviceCaps) against the real
-    # physical label size — not assumed. Match the larger pixel dimension
-    # to the label's longer physical side, whichever way it's oriented.
-    long_side_px = max(width_px, height_px)
-    long_side_mm = max(LABEL_WIDTH_MM, LABEL_HEIGHT_MM)
-    actual_dpi = max(72, round(long_side_px / (long_side_mm / 25.4)))
+    # actual_dpi derived from the fixed tape width (the short side of the
+    # canvas), the more reliable known-good reference dimension.
+    short_side_px = min(width_px, height_px)
+    actual_dpi = max(72, round(short_side_px / (LABEL_WIDTH_MM / 25.4)))
 
-    # Learn how many "module units" this specific content needs by
-    # rendering once at a reference module width (scales linearly; quiet
-    # zone doesn't, so it's subtracted out).
-    ref_module_width = 1.0
-    ref_bc = barcode_class(code_value, writer=ImageWriter(dpi=actual_dpi))
-    ref_opts = {
-        "module_width": ref_module_width,
-        "module_height": 15.0,
+    bc = barcode_class(code_value, writer=ImageWriter(dpi=actual_dpi))
+    opts = {
+        "module_width": CONTINUOUS_MODULE_WIDTH_MM,
+        "module_height": module_height_mm,
         "font_size": 0,
         "text_distance": 0,
         "quiet_zone": quiet_zone_mm,
     }
-    ref_img = ref_bc.render(writer_options=ref_opts)
-    ref_total_width_mm = ref_img.width / actual_dpi * 25.4
-    data_modules = (ref_total_width_mm - 2 * quiet_zone_mm) / ref_module_width
+    bc_final = bc.render(writer_options=opts)
 
-    # Solve for the module width that makes the barcode fill the label's
-    # long dimension (minus margins), given this content's actual module count.
-    target_total_mm = long_side_mm - 2 * margin_mm
-    ideal_module_width = (target_total_mm - 2 * quiet_zone_mm) / data_modules
-    ideal_module_width = max(0.2, ideal_module_width)  # never thinner than the library's own safe default
-
-    final_bc = barcode_class(code_value, writer=ImageWriter(dpi=actual_dpi))
-    final_opts = {
-        "module_width": ideal_module_width,
-        "module_height": 15.0,
-        "font_size": 0,
-        "text_distance": 0,
-        "quiet_zone": quiet_zone_mm,
-    }
-    bc_final = final_bc.render(writer_options=final_opts)
-
-    # bc_final was sized to match the label's LONG dimension along its own
-    # width (bars run horizontally). If the canvas itself is portrait
-    # (taller than wide), rotate so the barcode's long axis lines up with
-    # the canvas's long axis (height) instead of getting squeezed into the
-    # short one.
+    # bc_final's width is the feed-direction length, height is across the
+    # tape width. If the canvas is portrait (taller than wide), rotate to
+    # match — same logic as before.
     canvas_is_portrait = height_px > width_px
     if canvas_is_portrait:
         bc_final = bc_final.rotate(90, expand=True)
 
-    # Rendered directly at the printer's real resolution and the label's
-    # real physical size — should already fit without further scaling.
-    # Clamp defensively in case of rounding, but this should be a no-op.
+    # Should already fit closely since the canvas was sized for this exact
+    # content — clamp defensively in case of rounding only.
     if bc_final.width > width_px or bc_final.height > height_px:
         shrink = min(width_px / bc_final.width, height_px / bc_final.height)
         bc_final = bc_final.resize(
@@ -322,11 +312,11 @@ def build_label_image(part_number: str, serial_number: str, part_name: str, widt
     return label
 
 
-def get_forced_label_devmode(printer_name: str):
+def get_forced_label_devmode(printer_name: str, length_mm: float):
     """
-    Build a DEVMODE forcing the exact physical label size (LABEL_WIDTH_MM x
-    LABEL_HEIGHT_MM), instead of trusting whatever the driver's ambient/
-    last-used print settings currently are.
+    Build a DEVMODE forcing the exact tape width (LABEL_WIDTH_MM, fixed)
+    and a specific length for this print job (continuous roll stock has no
+    fixed length — it's computed per print from the barcode content).
 
     NOTE: this is the one piece of this file I could not test against real
     hardware — win32print/win32ui only run on Windows, and I have no
@@ -344,7 +334,7 @@ def get_forced_label_devmode(printer_name: str):
         # DEVMODE paper width/length are in tenths of a millimetre.
         devmode.PaperSize = 0  # 0 = custom, use PaperWidth/PaperLength below
         devmode.PaperWidth = int(LABEL_WIDTH_MM * 10)
-        devmode.PaperLength = int(LABEL_HEIGHT_MM * 10)
+        devmode.PaperLength = int(length_mm * 10)
         devmode.Fields |= win32con.DM_PAPERSIZE | win32con.DM_PAPERWIDTH | win32con.DM_PAPERLENGTH
 
         # Let the driver validate/normalize our requested settings — some
@@ -363,12 +353,14 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     """Send a label straight to the Windows-installed printer via GDI —
     confirmed working through the normal Windows print system."""
     printer_name = load_printer_name()
+    code_value = compute_barcode_value(part_number, serial_number)
+    needed_length_mm = compute_continuous_label_length_mm(code_value)
 
     hDC = win32ui.CreateDC()
     try:
-        devmode = get_forced_label_devmode(printer_name)
+        devmode = get_forced_label_devmode(printer_name, needed_length_mm)
         hDC.CreateDC("WINSPOOL", printer_name, None, devmode)
-        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {LABEL_HEIGHT_MM}mm via DEVMODE.")
+        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {needed_length_mm:.1f}mm via DEVMODE.")
     except Exception as e:
         # Untested path above failed for some reason — fall back to the
         # previously-working approach (whatever the driver's current
@@ -385,7 +377,7 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     printable_h = hDC.GetDeviceCaps(10)
     print(f"[i] Printer reports printable area: {printable_w} x {printable_h} px")
 
-    label = build_label_image(part_number, serial_number, part_name, printable_w, printable_h)
+    label = build_label_image(code_value, printable_w, printable_h)
 
     # Save every generated label so it can be inspected/verified — this is
     # what actually gets sent to the printer, so if nothing is coming out
