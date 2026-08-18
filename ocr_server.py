@@ -54,7 +54,7 @@ DEFAULT_PRINTER_NAME = "Brother QL-800"
 # each print job's length is computed from how much the barcode content
 # actually needs, then forced via DEVMODE for that specific job.
 LABEL_WIDTH_MM = 62
-CONTINUOUS_MODULE_WIDTH_MM = 0.4  # solid, reliable bar width — length grows to fit rather than squeezing into a target
+CONTINUOUS_MODULE_WIDTH_MM = 0.5  # solid, reliable bar width — length grows to fit rather than squeezing into a target
 CONTINUOUS_FEED_MARGIN_MM = 4.0   # blank margin before/after the barcode along the feed direction
 
 # ── Shape library storage ────────────────────────────────────────────────────
@@ -238,11 +238,13 @@ GAP_BETWEEN_BARCODES_MM = 5.0
 
 
 def compute_barcode_pieces(part_number: str, serial_number: str) -> list[str]:
-    """Separate barcode values to print, in order — part number first,
-    then serial number if present. Each becomes its own distinct barcode
-    rather than being merged into one combined code."""
-    pieces = [v for v in (part_number, serial_number) if v]
-    return pieces or ["UNKNOWN"]
+    """Single barcode encoding both part number and serial number together
+    (pipe-separated) when both are present. Returns a 1-item list so it
+    reuses the same rendering/stacking logic as before without duplicating
+    it — with one piece, no extra gap gets added."""
+    if part_number and serial_number:
+        return [f"{part_number}|{serial_number}"]
+    return [part_number or serial_number or "UNKNOWN"]
 
 
 def _render_piece(value: str, dpi: float, module_height_mm: float) -> Image.Image:
