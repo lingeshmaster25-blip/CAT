@@ -54,9 +54,9 @@ DEFAULT_PRINTER_NAME = "Brother QL-800"
 # itself). Unlike die-cut labels, continuous stock has no fixed length —
 # each print job's length is computed from how much the barcode content
 # actually needs, then forced via DEVMODE for that specific job.
+# Physical label stock — die-cut, 62mm x 91.5mm (both dimensions fixed).
 LABEL_WIDTH_MM = 62
-CONTINUOUS_MODULE_WIDTH_MM = 0.5  # solid, reliable bar width — length grows to fit rather than squeezing into a target
-CONTINUOUS_FEED_MARGIN_MM = 4.0   # blank margin before/after the barcode along the feed direction
+LABEL_HEIGHT_MM = 91.5
 
 # ── Shape library storage ────────────────────────────────────────────────────
 # Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
@@ -239,66 +239,65 @@ GAP_BETWEEN_BARCODES_MM = 5.0
 
 
 def compute_barcode_pieces(part_number: str, serial_number: str) -> list[str]:
-    """Single barcode encoding both part number and serial number together
-    (pipe-separated) when both are present. Returns a 1-item list so it
-    reuses the same rendering/stacking logic as before without duplicating
-    it — with one piece, no extra gap gets added."""
-    if part_number and serial_number:
-        return [f"{part_number}|{serial_number}"]
-    return [part_number or serial_number or "UNKNOWN"]
+    """Separate barcodes, serial number on top, part number below. If only
+    one is present (e.g. this part has no serial), returns just that one
+    piece — build_label_image() centers a single piece automatically."""
+    pieces = [v for v in (serial_number, part_number) if v]
+    return pieces or ["UNKNOWN"]
 
 
-def _render_piece(value: str, dpi: float, module_height_mm: float) -> Image.Image:
+def _render_piece(value: str, dpi: float, module_width_mm: float, module_height_mm: float, quiet_zone_mm: float) -> Image.Image:
     barcode_class = barcode.get_barcode_class("code128")
     bc = barcode_class(value, writer=ImageWriter(dpi=dpi))
     opts = {
-        "module_width": CONTINUOUS_MODULE_WIDTH_MM,
+        "module_width": module_width_mm,
         "module_height": module_height_mm,
         "font_size": 0,
         "text_distance": 0,
-        "quiet_zone": 4.0,
+        "quiet_zone": quiet_zone_mm,
     }
     return bc.render(writer_options=opts)
 
 
-def compute_continuous_label_length_mm(pieces: list[str]) -> float:
-    """
-    For continuous roll stock, there's no fixed length to fit — instead we
-    use a solid, reliable module width and let the length be however long
-    that naturally comes out to for however many barcodes we're printing,
-    stacked one after another with a gap between each.
-    """
-    module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)  # generous bar height within the tape width, leaving margin
-    total_mm = 0.0
-    for i, value in enumerate(pieces):
-        img = _render_piece(value, dpi=300, module_height_mm=module_height_mm)
-        total_mm += img.width / 300 * 25.4
-        if i < len(pieces) - 1:
-            total_mm += GAP_BETWEEN_BARCODES_MM
-    return total_mm + 2 * CONTINUOUS_FEED_MARGIN_MM
-
-
 def build_label_image(pieces: list[str], width_px: int, height_px: int) -> Image.Image:
     """
-    Render one or more barcodes (Code128), stacked one after another along
-    the label's long axis with a gap between each, using the solid module
-    width chosen for continuous roll stock — the canvas here was already
-    sized in print_label() to match what this content needs.
+    Render one or two barcodes (Code128), with module width SOLVED to
+    fill the label's fixed long dimension (die-cut stock — both width and
+    length are fixed: LABEL_WIDTH_MM x LABEL_HEIGHT_MM). Stacked with a
+    gap between them if there are two; a single piece is centered.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
-    module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)
+    quiet_zone_mm = 4.0
+    margin_mm = 3.0
+    module_height_mm = 15.0
 
-    # actual_dpi derived from the fixed tape width (the short side of the
-    # canvas), the more reliable known-good reference dimension.
-    short_side_px = min(width_px, height_px)
-    actual_dpi = max(72, round(short_side_px / (LABEL_WIDTH_MM / 25.4)))
-    gap_px = int(GAP_BETWEEN_BARCODES_MM / 25.4 * actual_dpi)
+    long_side_px = max(width_px, height_px)
+    long_side_mm = max(LABEL_WIDTH_MM, LABEL_HEIGHT_MM)
+    actual_dpi = max(72, round(long_side_px / (long_side_mm / 25.4)))
+
+    n = len(pieces)
+    gap_px = int(GAP_BETWEEN_BARCODES_MM / 25.4 * actual_dpi) if n > 1 else 0
+    gap_mm_total = GAP_BETWEEN_BARCODES_MM * (n - 1)
+
+    # Learn how many "module units" this content needs (summed across all
+    # pieces) by rendering once at a reference module width.
+    ref_module_width = 1.0
+    total_ref_width_mm = 0.0
+    for value in pieces:
+        ref_img = _render_piece(value, actual_dpi, ref_module_width, module_height_mm, quiet_zone_mm)
+        total_ref_width_mm += ref_img.width / actual_dpi * 25.4
+    total_data_modules = (total_ref_width_mm - 2 * quiet_zone_mm * n) / ref_module_width
+
+    # Solve for the module width that makes everything (all pieces + gaps)
+    # fill the label's long dimension, minus margins.
+    target_total_mm = long_side_mm - 2 * margin_mm - gap_mm_total
+    ideal_module_width = max(0.2, (target_total_mm - 2 * quiet_zone_mm * n) / total_data_modules)
 
     canvas_is_portrait = height_px > width_px
 
     rendered = []
     for value in pieces:
-        piece_img = _render_piece(value, dpi=actual_dpi, module_height_mm=module_height_mm)
+        piece_img = _render_piece(value, actual_dpi, ideal_module_width, module_height_mm, quiet_zone_mm)
         if canvas_is_portrait:
             piece_img = piece_img.rotate(90, expand=True)
         rendered.append(piece_img)
@@ -309,6 +308,16 @@ def build_label_image(pieces: list[str], width_px: int, height_px: int) -> Image
     total_long = sum(im.size[long_axis] for im in rendered) + gap_px * (len(rendered) - 1)
     canvas_long = height_px if canvas_is_portrait else width_px
     canvas_short = width_px if canvas_is_portrait else height_px
+
+    # Should already fit closely — clamp defensively in case of rounding.
+    if total_long > canvas_long:
+        shrink = canvas_long / total_long
+        rendered = [
+            im.resize((max(1, int(im.width * shrink)), max(1, int(im.height * shrink))), Image.NEAREST)
+            for im in rendered
+        ]
+        total_long = sum(im.size[long_axis] for im in rendered) + int(gap_px * shrink) * (len(rendered) - 1)
+        gap_px = int(gap_px * shrink)
 
     cursor = (canvas_long - total_long) // 2
     for piece_img in rendered:
@@ -378,19 +387,21 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     confirmed working through the normal Windows print system."""
     printer_name = load_printer_name()
     pieces = compute_barcode_pieces(part_number, serial_number)
-    needed_length_mm = compute_continuous_label_length_mm(pieces)
+    # Die-cut stock: length is fixed (LABEL_HEIGHT_MM), not computed per print.
 
-    devmode = get_forced_label_devmode(printer_name, needed_length_mm)
+    devmode = get_forced_label_devmode(printer_name, LABEL_HEIGHT_MM)
     try:
         # win32ui's PyCDC has no generic CreateDC(driver, device, output,
         # devmode) method — that was my earlier incorrect guess. The
         # actual way to apply a custom DEVMODE is the lower-level
-        # win32gui.CreateDC(), which returns a raw HDC handle; wrap that
-        # into a PyCDC via CreateDCFromHandle to get the StartDoc/StartPage
-        # etc. methods the rest of this function uses.
-        raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, None, devmode)
+        # win32gui.CreateDC(driver, device, devmode) — note: only 3 args,
+        # it drops the rarely-used "output" parameter the raw Win32 API
+        # has. Returns a raw HDC handle; wrap that into a PyCDC via
+        # CreateDCFromHandle to get the StartDoc/StartPage etc. methods
+        # the rest of this function uses.
+        raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
         hDC = win32ui.CreateDCFromHandle(raw_hdc)
-        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {needed_length_mm:.1f}mm via DEVMODE.")
+        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {LABEL_HEIGHT_MM}mm via DEVMODE.")
     except Exception as e:
         # Fall back to the previously-working ambient approach rather than
         # failing the print entirely — but note this means the custom
