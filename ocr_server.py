@@ -34,6 +34,7 @@ from barcode.writer import ImageWriter
 import win32print
 import win32ui
 import win32con
+import win32gui
 from PIL import ImageWin
 
 # ── API Key ───────────────────────────────────────────────────────────────────
@@ -379,16 +380,23 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     pieces = compute_barcode_pieces(part_number, serial_number)
     needed_length_mm = compute_continuous_label_length_mm(pieces)
 
-    hDC = win32ui.CreateDC()
+    devmode = get_forced_label_devmode(printer_name, needed_length_mm)
     try:
-        devmode = get_forced_label_devmode(printer_name, needed_length_mm)
-        hDC.CreateDC("WINSPOOL", printer_name, None, devmode)
+        # win32ui's PyCDC has no generic CreateDC(driver, device, output,
+        # devmode) method — that was my earlier incorrect guess. The
+        # actual way to apply a custom DEVMODE is the lower-level
+        # win32gui.CreateDC(), which returns a raw HDC handle; wrap that
+        # into a PyCDC via CreateDCFromHandle to get the StartDoc/StartPage
+        # etc. methods the rest of this function uses.
+        raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, None, devmode)
+        hDC = win32ui.CreateDCFromHandle(raw_hdc)
         print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {needed_length_mm:.1f}mm via DEVMODE.")
     except Exception as e:
-        # Untested path above failed for some reason — fall back to the
-        # previously-working approach (whatever the driver's current
-        # settings are) rather than failing the print entirely.
+        # Fall back to the previously-working ambient approach rather than
+        # failing the print entirely — but note this means the custom
+        # length won't be applied, so continuous-roll jobs may paginate.
         print(f"[!] Couldn't force label size via DEVMODE ({e}); falling back to ambient printer settings.")
+        hDC = win32ui.CreateDC()
         hDC.CreatePrinterDC(printer_name)
 
     hDC.StartDoc("EZI Label")
