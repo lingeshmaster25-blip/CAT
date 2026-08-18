@@ -234,21 +234,20 @@ def load_printer_name() -> str:
         return DEFAULT_PRINTER_NAME
 
 
-def compute_barcode_value(part_number: str, serial_number: str) -> str:
-    if part_number and serial_number:
-        return f"{part_number}|{serial_number}"
-    return part_number or serial_number or "UNKNOWN"
+GAP_BETWEEN_BARCODES_MM = 5.0
 
 
-def compute_continuous_label_length_mm(code_value: str) -> float:
-    """
-    For continuous roll stock, there's no fixed length to fit — instead we
-    use a solid, reliable module width and let the length be however long
-    that naturally comes out to for this specific content.
-    """
+def compute_barcode_pieces(part_number: str, serial_number: str) -> list[str]:
+    """Separate barcode values to print, in order — part number first,
+    then serial number if present. Each becomes its own distinct barcode
+    rather than being merged into one combined code."""
+    pieces = [v for v in (part_number, serial_number) if v]
+    return pieces or ["UNKNOWN"]
+
+
+def _render_piece(value: str, dpi: float, module_height_mm: float) -> Image.Image:
     barcode_class = barcode.get_barcode_class("code128")
-    module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)  # generous bar height within the tape width, leaving margin
-    bc = barcode_class(code_value, writer=ImageWriter(dpi=300))
+    bc = barcode_class(value, writer=ImageWriter(dpi=dpi))
     opts = {
         "module_width": CONTINUOUS_MODULE_WIDTH_MM,
         "module_height": module_height_mm,
@@ -256,58 +255,68 @@ def compute_continuous_label_length_mm(code_value: str) -> float:
         "text_distance": 0,
         "quiet_zone": 4.0,
     }
-    img = bc.render(writer_options=opts)
-    content_length_mm = img.width / 300 * 25.4
-    return content_length_mm + 2 * CONTINUOUS_FEED_MARGIN_MM
+    return bc.render(writer_options=opts)
 
 
-def build_label_image(code_value: str, width_px: int, height_px: int) -> Image.Image:
+def compute_continuous_label_length_mm(pieces: list[str]) -> float:
     """
-    Render a label as just a barcode (Code128), using the solid module
-    width chosen for continuous roll stock (see compute_continuous_label_length_mm)
-    — the canvas here was already sized in print_label() to match what
-    this specific barcode needs, so this mostly just needs to render it
-    natively and center it, handling orientation.
+    For continuous roll stock, there's no fixed length to fit — instead we
+    use a solid, reliable module width and let the length be however long
+    that naturally comes out to for however many barcodes we're printing,
+    stacked one after another with a gap between each.
+    """
+    module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)  # generous bar height within the tape width, leaving margin
+    total_mm = 0.0
+    for i, value in enumerate(pieces):
+        img = _render_piece(value, dpi=300, module_height_mm=module_height_mm)
+        total_mm += img.width / 300 * 25.4
+        if i < len(pieces) - 1:
+            total_mm += GAP_BETWEEN_BARCODES_MM
+    return total_mm + 2 * CONTINUOUS_FEED_MARGIN_MM
+
+
+def build_label_image(pieces: list[str], width_px: int, height_px: int) -> Image.Image:
+    """
+    Render one or more barcodes (Code128), stacked one after another along
+    the label's long axis with a gap between each, using the solid module
+    width chosen for continuous roll stock — the canvas here was already
+    sized in print_label() to match what this content needs.
     """
     label = Image.new("RGB", (width_px, height_px), "white")
-    barcode_class = barcode.get_barcode_class("code128")
-    quiet_zone_mm = 4.0
     module_height_mm = max(10.0, LABEL_WIDTH_MM - 14)
 
     # actual_dpi derived from the fixed tape width (the short side of the
     # canvas), the more reliable known-good reference dimension.
     short_side_px = min(width_px, height_px)
     actual_dpi = max(72, round(short_side_px / (LABEL_WIDTH_MM / 25.4)))
+    gap_px = int(GAP_BETWEEN_BARCODES_MM / 25.4 * actual_dpi)
 
-    bc = barcode_class(code_value, writer=ImageWriter(dpi=actual_dpi))
-    opts = {
-        "module_width": CONTINUOUS_MODULE_WIDTH_MM,
-        "module_height": module_height_mm,
-        "font_size": 0,
-        "text_distance": 0,
-        "quiet_zone": quiet_zone_mm,
-    }
-    bc_final = bc.render(writer_options=opts)
-
-    # bc_final's width is the feed-direction length, height is across the
-    # tape width. If the canvas is portrait (taller than wide), rotate to
-    # match — same logic as before.
     canvas_is_portrait = height_px > width_px
-    if canvas_is_portrait:
-        bc_final = bc_final.rotate(90, expand=True)
 
-    # Should already fit closely since the canvas was sized for this exact
-    # content — clamp defensively in case of rounding only.
-    if bc_final.width > width_px or bc_final.height > height_px:
-        shrink = min(width_px / bc_final.width, height_px / bc_final.height)
-        bc_final = bc_final.resize(
-            (max(1, int(bc_final.width * shrink)), max(1, int(bc_final.height * shrink))),
-            Image.NEAREST,
-        )
+    rendered = []
+    for value in pieces:
+        piece_img = _render_piece(value, dpi=actual_dpi, module_height_mm=module_height_mm)
+        if canvas_is_portrait:
+            piece_img = piece_img.rotate(90, expand=True)
+        rendered.append(piece_img)
 
-    x = (width_px - bc_final.width) // 2
-    y = (height_px - bc_final.height) // 2
-    label.paste(bc_final, (x, y))
+    # Total extent along the long axis, to center the whole stack.
+    long_axis = 1 if canvas_is_portrait else 0
+    short_axis = 0 if canvas_is_portrait else 1
+    total_long = sum(im.size[long_axis] for im in rendered) + gap_px * (len(rendered) - 1)
+    canvas_long = height_px if canvas_is_portrait else width_px
+    canvas_short = width_px if canvas_is_portrait else height_px
+
+    cursor = (canvas_long - total_long) // 2
+    for piece_img in rendered:
+        piece_short = piece_img.size[short_axis]
+        offset_short = (canvas_short - piece_short) // 2
+        if canvas_is_portrait:
+            pos = (offset_short, cursor)
+        else:
+            pos = (cursor, offset_short)
+        label.paste(piece_img, pos)
+        cursor += piece_img.size[long_axis] + gap_px
 
     return label
 
@@ -353,8 +362,8 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     """Send a label straight to the Windows-installed printer via GDI —
     confirmed working through the normal Windows print system."""
     printer_name = load_printer_name()
-    code_value = compute_barcode_value(part_number, serial_number)
-    needed_length_mm = compute_continuous_label_length_mm(code_value)
+    pieces = compute_barcode_pieces(part_number, serial_number)
+    needed_length_mm = compute_continuous_label_length_mm(pieces)
 
     hDC = win32ui.CreateDC()
     try:
@@ -377,7 +386,7 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     printable_h = hDC.GetDeviceCaps(10)
     print(f"[i] Printer reports printable area: {printable_w} x {printable_h} px")
 
-    label = build_label_image(code_value, printable_w, printable_h)
+    label = build_label_image(pieces, printable_w, printable_h)
 
     # Save every generated label so it can be inspected/verified — this is
     # what actually gets sent to the printer, so if nothing is coming out
