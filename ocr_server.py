@@ -14,6 +14,7 @@ Run:
 """
 
 import io
+import math
 import json
 import os
 import re
@@ -50,13 +51,20 @@ API_KEY = "EZI-TRILO-OCR-2025"
 PRINT_CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "EZI OCR Server" / "printer.json"
 DEFAULT_PRINTER_NAME = "Brother QL-800"
 
-# Physical label stock — continuous roll, 62mm wide (fixed by the tape
-# itself). Unlike die-cut labels, continuous stock has no fixed length —
-# each print job's length is computed from how much the barcode content
-# actually needs, then forced via DEVMODE for that specific job.
-# Physical label stock — die-cut, 62mm x 91.5mm (both dimensions fixed).
-LABEL_WIDTH_MM = 62
-LABEL_HEIGHT_MM = 91.5
+# Physical label stock — 12 mm wide CONTINUOUS tape (8 m or 30 m roll).
+# The tape width is fixed; the length of each printed label is computed per
+# print job from the barcode content (a longer value => a longer label), then
+# forced via DEVMODE for that job.
+#   LABEL_WIDTH_MM   = tape width (short side, fixed)
+#   MODULE_WIDTH_MM  = width of the thinnest barcode bar. 0.17 mm = 2 printer dots at 300 dpi (matches the sample label); raise to 0.254 (3 dots) if scans fail. 0.25 mm scans
+#                      reliably; do not go much below ~0.2 mm.
+#   MIN_LENGTH_MM    = shortest label that will ever be printed
+#   SIDE_MARGIN_MM   = blank tape at each end, beyond the barcode quiet zone
+LABEL_WIDTH_MM = 12
+MODULE_WIDTH_MM = 0.17
+MIN_LENGTH_MM = 30
+SIDE_MARGIN_MM = 1.0
+QUIET_ZONE_MM = 1.5
 
 # ── Shape library storage ────────────────────────────────────────────────────
 # Same persistent-data convention as the launcher (%LOCALAPPDATA%\EZI OCR
@@ -132,13 +140,13 @@ def run_model(pil_image: Image.Image) -> str:
                 {
                     "type": "text",
                     "text": (
-                        "This is an embossed industrial machine plate. "
-                        "Read the text on the plate carefully. "
-                        "The plate has exactly two lines of text: "
-                        "the top line is the SERIAL NUMBER and the bottom line is the PART NUMBER. "
+                        "This is an embossed industrial machine plate with exactly two lines "
+                        "of text. Transcribe each line exactly as embossed — character by "
+                        "character, top to bottom. Do not interpret, classify, correct, or "
+                        "reorder anything; just read what is physically there.\n"
                         "Respond in this exact format only, with no extra words:\n"
-                        "SERIAL: <value>\n"
-                        "PART: <value>"
+                        "LINE1: <first line, top to bottom, exactly as embossed>\n"
+                        "LINE2: <second line, top to bottom, exactly as embossed>"
                     ),
                 },
             ],
@@ -172,40 +180,105 @@ def run_model(pil_image: Image.Image) -> str:
     )[0]
 
 
+def looks_like_serial(value: str) -> bool:
+    """
+    Best-effort heuristic for this business's serial-number convention: a
+    short leading letter code (e.g. 'CM1', 'IMOP') followed by space-
+    separated digit groups, one of which looks like a two-digit month
+    (01-12) — matching the "plant code + date + sequence" pattern.
+
+    Deliberately NOT given to the model as a prompt example (that caused
+    the model to literally echo example values instead of reading the
+    plate — see run_model). This lives in code instead, where it's
+    inspectable and tunable against real scans without risking the model
+    copying it.
+
+    Tuned against real examples so far:
+      'IMOP 09 26 0500' -> True  (serial: IMOP + month 09 + 26 + 0500)
+      'CM1 05 26 0017'  -> True  (serial: CM1 + month 05 + 26 + 0017)
+      '658 7404 08'     -> False (part: no letters at all)
+      '9R0314'          -> False (part: letter embedded mid-digits, no
+                            leading letter block, no space-separated
+                            month-like group)
+    """
+    v = value.strip().upper()
+    m = re.match(r"^([A-Z]+[0-9]?)\s+(.*)$", v)
+    if not m:
+        return False
+    for group in m.group(2).split():
+        if re.fullmatch(r"0[1-9]|1[0-2]", group):
+            return True
+    return False
+
+
+def classify_serial_and_part(line1: str, line2: str) -> tuple[str, str]:
+    """
+    Decide which transcribed line is the serial number and which is the
+    part number. The model no longer attempts this classification itself
+    (see run_model's prompt) — it's done here deterministically so it can
+    be tuned against real plates without touching model behavior.
+    """
+    l1, l2 = line1.strip(), line2.strip()
+    if not l1 and not l2:
+        return "", ""
+    if not l2:
+        return (l1, "") if (looks_like_serial(l1) or re.search(r"[A-Z]", l1)) else ("", l1)
+    if not l1:
+        return (l2, "") if (looks_like_serial(l2) or re.search(r"[A-Z]", l2)) else ("", l2)
+
+    l1_serial, l2_serial = looks_like_serial(l1), looks_like_serial(l2)
+    if l1_serial and not l2_serial:
+        return l1, l2
+    if l2_serial and not l1_serial:
+        return l2, l1
+
+    # Neither matched the serial date-pattern confidently. Fall back to:
+    # a line with letters is more likely the serial in this convention
+    # (part numbers here are pure digits, or short codes with an embedded
+    # rather than leading letter) — prefer whichever line has letters.
+    l1_has_letters, l2_has_letters = bool(re.search(r"[A-Z]", l1)), bool(re.search(r"[A-Z]", l2))
+    if l1_has_letters and not l2_has_letters:
+        return l1, l2
+    if l2_has_letters and not l1_has_letters:
+        return l2, l1
+
+    # Truly ambiguous — keep the model's own line order.
+    return l1, l2
+
+
 def parse_output(raw: str) -> dict:
     """
-    Parse Qwen output into serial / part / confidence.
-    Expected format:
-        SERIAL: CM1 05 26 0017
-        PART: 668 9100 02
-    Falls back to line splitting if the model doesn't follow the format exactly.
+    Parse Qwen's raw transcription (LINE1/LINE2, see run_model) into
+    serial / part / confidence. Falls back to naive line splitting if the
+    model doesn't follow the LINE1:/LINE2: format exactly.
     """
-    serial = ""
-    part = ""
+    line1 = ""
+    line2 = ""
 
-    # Try structured format first
-    serial_match = re.search(r"SERIAL[:\s]+([A-Z0-9 \-]+)", raw, re.IGNORECASE)
-    part_match   = re.search(r"PART[:\s]+([A-Z0-9 \-]+)",   raw, re.IGNORECASE)
+    line1_match = re.search(r"LINE1[:\s]+([A-Z0-9 \-]+)", raw, re.IGNORECASE)
+    line2_match = re.search(r"LINE2[:\s]+([A-Z0-9 \-]+)", raw, re.IGNORECASE)
 
-    if serial_match:
-        serial = serial_match.group(1).strip().upper()
-    if part_match:
-        part = part_match.group(1).strip().upper()
+    if line1_match:
+        line1 = line1_match.group(1).strip().upper()
+    if line2_match:
+        line2 = line2_match.group(1).strip().upper()
 
     # Fallback: just take the first two non-empty lines
-    if not serial and not part:
+    if not line1 and not line2:
         lines = [
             re.sub(r"[^A-Z0-9 ]", " ", l).strip().upper()
             for l in raw.splitlines()
             if re.sub(r"[^A-Z0-9 ]", "", l).strip()
         ]
         if lines:
-            serial = lines[0]
+            line1 = lines[0]
         if len(lines) > 1:
-            part = lines[1]
+            line2 = lines[1]
+
+    serial, part = classify_serial_and_part(line1, line2)
 
     # Estimate confidence based on how well the output matched
-    confidence = 90.0 if (serial_match and part_match) else 65.0
+    confidence = 90.0 if (line1_match and line2_match) else 65.0
 
     return {"serial": serial, "part": part, "confidence": confidence}
 
@@ -214,11 +287,24 @@ def parse_output(raw: str) -> dict:
 
 def compute_shape_embedding(pil_image: Image.Image) -> list[float]:
     """Return a normalized CLIP image embedding as a plain Python list
-    (JSON-serializable, easy to store alongside the reference library)."""
+    (JSON-serializable, easy to store alongside the reference library).
+
+    Deliberately calls clip_model.vision_model + clip_model.visual_projection
+    directly instead of clip_model.get_image_features(...) — on the
+    transformers version installed on the production server,
+    get_image_features() returns the raw vision-tower output
+    (a BaseModelOutputWithPooling) instead of the projected embedding
+    tensor, which crashed every /shapes/register call with:
+    "AttributeError: 'BaseModelOutputWithPooling' object has no attribute
+    'norm'". Going straight to vision_model + visual_projection sidesteps
+    that entirely and is correct on every transformers version.
+    """
     inputs = clip_processor(images=pil_image, return_tensors="pt").to(device)
     inputs["pixel_values"] = inputs["pixel_values"].to(torch_dtype)
     with torch.no_grad():
-        features = clip_model.get_image_features(**inputs)
+        vision_outputs = clip_model.vision_model(pixel_values=inputs["pixel_values"])
+        pooled_output = vision_outputs.pooler_output
+        features = clip_model.visual_projection(pooled_output)
         features = features / features.norm(p=2, dim=-1, keepdim=True)
     return features[0].float().cpu().tolist()
 
@@ -241,12 +327,13 @@ def compute_barcode_pieces(part_number: str, serial_number: str) -> list[tuple[s
     label is only used for the human-readable caption. If only one is
     present (e.g. this part has no serial), returns just that one piece —
     build_label_image() centers a single piece automatically."""
-    pieces = []
-    if serial_number:
-        pieces.append(("Serial Number", serial_number))
-    if part_number:
-        pieces.append(("Part Number", part_number))
-    return pieces or [("Part Number", "UNKNOWN")]
+    # One combined barcode "SERIAL|PART" (whitespace stripped) — same value
+    # the app shows on screen. Its own value is printed underneath; no
+    # separate caption line above it.
+    s = re.sub(r"\s+", "", serial_number or "")
+    p = re.sub(r"\s+", "", part_number or "")
+    value = f"{s}|{p}" if (s and p) else (s or p or "UNKNOWN")
+    return [("", value)]
 
 
 def _render_piece(value: str, dpi: float, module_width_mm: float, module_height_mm: float, quiet_zone_mm: float) -> Image.Image:
@@ -265,7 +352,10 @@ def _render_piece(value: str, dpi: float, module_width_mm: float, module_height_
     return bc.render(writer_options=opts)
 
 
-def _compose_with_text(bars_img: Image.Image, caption_text: str, dpi: float, max_width_px: int) -> Image.Image:
+def _compose_with_text(
+    bars_img: Image.Image, caption_text: str, dpi: float, max_width_px: int,
+    font_pt: float = 24, gap_mm: float = 3,
+) -> Image.Image:
     """Stack upright, horizontal caption text below the (possibly
     already-rotated) bars image. Always horizontal regardless of the bars'
     own orientation — this is what keeps text readable after rotation.
@@ -282,14 +372,14 @@ def _compose_with_text(bars_img: Image.Image, caption_text: str, dpi: float, max
         return f, bbox[2] - bbox[0], bbox[3] - bbox[1]
 
     # Start from a reasonable size and scale down to fit if needed.
-    font_size = max(8, int(dpi * 24 / 72))
+    font_size = max(8, int(dpi * font_pt / 72))
     font, text_w, text_h = measure(font_size)
     max_text_w = int(max_width_px * 0.92)
     if text_w > max_text_w:
         font_size = max(8, int(font_size * max_text_w / text_w))
         font, text_w, text_h = measure(font_size)
 
-    text_margin = int(dpi * 3 / 25.4)  # ~3mm gap between bars and text
+    text_margin = int(dpi * gap_mm / 25.4)  # gap between bars and text
     out_w = max(bars_img.width, text_w)
     out_h = bars_img.height + text_margin + text_h + 4
     out = Image.new("RGB", (out_w, out_h), "white")
@@ -303,64 +393,69 @@ def _compose_with_text(bars_img: Image.Image, caption_text: str, dpi: float, max
     return out
 
 
+def compute_label_length_mm(value: str) -> float:
+    """Label length needed for this barcode value at MODULE_WIDTH_MM bars,
+    including quiet zones and end margins (never below MIN_LENGTH_MM)."""
+    ref_dpi = 300
+    img = _render_piece(value, ref_dpi, MODULE_WIDTH_MM, 5.0, QUIET_ZONE_MM)
+    bars_mm = img.width / ref_dpi * 25.4
+    return float(max(MIN_LENGTH_MM, math.ceil(bars_mm + 2 * SIDE_MARGIN_MM)))
+
+
 def build_label_image(pieces: list[tuple[str, str]], width_px: int, height_px: int) -> Image.Image:
     """
-    Landscape label — width_px is the long dimension (91.5mm, where the
-    bars run), height_px is the short dimension (62mm, split into equal
-    bands stacked top-to-bottom, one per piece: serial on top, part on
-    bottom). Bars are always drawn horizontally, never rotated, since the
-    canvas is wide enough on its own.
+    One combined barcode (bars) with its value printed underneath, centred
+    on a continuous-tape label LABEL_WIDTH_MM (12 mm) wide and as long as
+    compute_label_length_mm() says (the DEVMODE length for this job).
+
+    Orientation-agnostic: the design is built landscape (long side
+    horizontal). If the driver reports a portrait printable area
+    (height > width), the finished landscape image is rotated 90 degrees to
+    fill it, so it works whichever way the driver feeds the tape.
     """
-    label = Image.new("RGB", (width_px, height_px), "white")
-    quiet_zone_mm = 4.0
-    margin_mm = 4.0
-    module_height_mm = 12.0  # fits comfortably within a 31mm band with room left for text
+    portrait = height_px > width_px
+    long_px, short_px = (height_px, width_px) if portrait else (width_px, height_px)
 
-    n = len(pieces)
-    band_height_px = height_px // n
-    actual_dpi = max(72, round(width_px / (LABEL_HEIGHT_MM / 25.4)))
+    value = pieces[0][1]
+    length_mm = compute_label_length_mm(value)
 
-    # Learn how many "module units" each piece needs, solve module width to
-    # fill the available width (long dimension) for each independently —
-    # unlike the stacked-along-one-axis case, each band has the FULL width
-    # available to itself, not a shared budget.
-    target_width_mm = LABEL_HEIGHT_MM - 2 * margin_mm
-    ref_module_width = 1.0
+    label = Image.new("RGB", (long_px, short_px), "white")
+    dpi = max(72, round(long_px / (length_mm / 25.4)))
 
-    for i, (piece_label, value) in enumerate(pieces):
-        ref_img = _render_piece(value, actual_dpi, ref_module_width, module_height_mm, quiet_zone_mm)
-        ref_width_mm = ref_img.width / actual_dpi * 25.4
-        data_modules = (ref_width_mm - 2 * quiet_zone_mm) / ref_module_width
-        ideal_module_width = max(0.2, (target_width_mm - 2 * quiet_zone_mm) / data_modules)
+    margin_mm = 0.8
+    font_pt = 6
+    gap_mm = 0.6
+    # Bars take what's left of the short side after margins, text and gap.
+    text_mm = font_pt * 25.4 / 72 * 1.25
+    module_height_mm = max(2.0, LABEL_WIDTH_MM - 2 * margin_mm - text_mm - gap_mm)
 
-        piece_img = _render_piece(value, actual_dpi, ideal_module_width, module_height_mm, quiet_zone_mm)
-        caption = piece_label
-        piece_img = _compose_with_text(piece_img, caption, actual_dpi, width_px)
+    bars = _render_piece(value, dpi, MODULE_WIDTH_MM, module_height_mm, QUIET_ZONE_MM)
+    piece_img = _compose_with_text(bars, value, dpi, long_px, font_pt=font_pt, gap_mm=gap_mm)
 
-        # Clamp defensively in case of rounding — target 96% of the band,
-        # not 100%, so nothing sits flush against the physical edge.
-        safe_band_h = int(band_height_px * 0.90)
-        safe_w = int(width_px * 0.94)
-        if piece_img.height > safe_band_h or piece_img.width > safe_w:
-            shrink = min(safe_band_h / piece_img.height, safe_w / piece_img.width)
-            piece_img = piece_img.resize(
-                (max(1, int(piece_img.width * shrink)), max(1, int(piece_img.height * shrink))),
-                Image.NEAREST,
-            )
+    # Clamp defensively (driver snapping the length/width a little) so
+    # nothing sits flush against, or runs off, the physical edge.
+    safe_w = int(long_px * 0.99)
+    safe_h = int(short_px * 0.96)
+    if piece_img.height > safe_h or piece_img.width > safe_w:
+        shrink = min(safe_h / piece_img.height, safe_w / piece_img.width)
+        piece_img = piece_img.resize(
+            (max(1, int(piece_img.width * shrink)), max(1, int(piece_img.height * shrink))),
+            Image.NEAREST,
+        )
 
-        band_top = i * band_height_px
-        x = (width_px - piece_img.width) // 2
-        y = band_top + (band_height_px - piece_img.height) // 2
-        label.paste(piece_img, (x, y))
+    x = (long_px - piece_img.width) // 2
+    y = (short_px - piece_img.height) // 2
+    label.paste(piece_img, (x, y))
 
+    if portrait:
+        label = label.rotate(90, expand=True)
     return label
 
 
 def get_forced_label_devmode(printer_name: str, length_mm: float):
     """
     Build a DEVMODE forcing the exact tape width (LABEL_WIDTH_MM, fixed)
-    and a specific length for this print job (continuous roll stock has no
-    fixed length — it's computed per print from the barcode content).
+    and a per-job length (continuous roll — computed from the barcode).
 
     NOTE: this is the one piece of this file I could not test against real
     hardware — win32print/win32ui only run on Windows, and I have no
@@ -410,9 +505,11 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
     confirmed working through the normal Windows print system."""
     printer_name = load_printer_name()
     pieces = compute_barcode_pieces(part_number, serial_number)
-    # Die-cut stock: length is fixed (LABEL_HEIGHT_MM), not computed per print.
+    # Continuous tape: length follows the barcode content.
+    length_mm = compute_label_length_mm(pieces[0][1])
+    print(f"[i] Label length for this print: {length_mm} mm (tape {LABEL_WIDTH_MM} mm)")
 
-    devmode = get_forced_label_devmode(printer_name, LABEL_HEIGHT_MM)
+    devmode = get_forced_label_devmode(printer_name, length_mm)
     try:
         # win32ui's PyCDC has no generic CreateDC(driver, device, output,
         # devmode) method — that was my earlier incorrect guess. The
@@ -424,7 +521,7 @@ def print_label(part_number: str, serial_number: str, part_name: str) -> None:
         # the rest of this function uses.
         raw_hdc = win32gui.CreateDC("WINSPOOL", printer_name, devmode)
         hDC = win32ui.CreateDCFromHandle(raw_hdc)
-        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {LABEL_HEIGHT_MM}mm via DEVMODE.")
+        print(f"[✓] Forced label size to {LABEL_WIDTH_MM}mm x {length_mm}mm via DEVMODE.")
     except Exception as e:
         # Fall back to the previously-working ambient approach rather than
         # failing the print entirely — but note this means the custom
