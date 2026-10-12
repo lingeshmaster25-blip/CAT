@@ -56,12 +56,15 @@ DEFAULT_PRINTER_NAME = "Brother QL-800"
 # print job from the barcode content (a longer value => a longer label), then
 # forced via DEVMODE for that job.
 #   LABEL_WIDTH_MM   = tape width (short side, fixed)
-#   MODULE_WIDTH_MM  = width of the thinnest barcode bar. 0.17 mm = 2 printer dots at 300 dpi (matches the sample label); raise to 0.254 (3 dots) if scans fail. 0.25 mm scans
-#                      reliably; do not go much below ~0.2 mm.
+#   MODULE_WIDTH_MM  = width of the thinnest barcode bar. 0.254 mm = 3 printer
+#                      dots at 300 dpi. 2 dots (0.17 mm) was tried and the bars
+#                      bled into each other when printed, so scanners could not
+#                      read it. Bars are always drawn as a WHOLE number of dots.
 #   MIN_LENGTH_MM    = shortest label that will ever be printed
 #   SIDE_MARGIN_MM   = blank tape at each end, beyond the barcode quiet zone
 LABEL_WIDTH_MM = 12
-MODULE_WIDTH_MM = 0.17
+MODULE_WIDTH_MM = 0.254
+MIN_MODULE_DOTS = 3   # never thinner than 3 printer dots
 MIN_LENGTH_MM = 30
 SIDE_MARGIN_MM = 1.0
 QUIET_ZONE_MM = 1.5
@@ -393,11 +396,19 @@ def _compose_with_text(
     return out
 
 
+def _module_mm_for_dpi(dpi: float) -> float:
+    """Bar width in mm rounded to a WHOLE number of printer dots (at least
+    MIN_MODULE_DOTS). Fractional dot widths make some bars 2 px and others
+    3 px wide, which merges/blurs bars on thermal printers."""
+    dots = max(MIN_MODULE_DOTS, round(MODULE_WIDTH_MM / 25.4 * dpi))
+    return dots * 25.4 / dpi
+
+
 def compute_label_length_mm(value: str) -> float:
     """Label length needed for this barcode value at MODULE_WIDTH_MM bars,
     including quiet zones and end margins (never below MIN_LENGTH_MM)."""
     ref_dpi = 300
-    img = _render_piece(value, ref_dpi, MODULE_WIDTH_MM, 5.0, QUIET_ZONE_MM)
+    img = _render_piece(value, ref_dpi, _module_mm_for_dpi(ref_dpi), 5.0, QUIET_ZONE_MM)
     bars_mm = img.width / ref_dpi * 25.4
     return float(max(MIN_LENGTH_MM, math.ceil(bars_mm + 2 * SIDE_MARGIN_MM)))
 
@@ -429,7 +440,7 @@ def build_label_image(pieces: list[tuple[str, str]], width_px: int, height_px: i
     text_mm = font_pt * 25.4 / 72 * 1.25
     module_height_mm = max(2.0, LABEL_WIDTH_MM - 2 * margin_mm - text_mm - gap_mm)
 
-    bars = _render_piece(value, dpi, MODULE_WIDTH_MM, module_height_mm, QUIET_ZONE_MM)
+    bars = _render_piece(value, dpi, _module_mm_for_dpi(dpi), module_height_mm, QUIET_ZONE_MM)
     piece_img = _compose_with_text(bars, value, dpi, long_px, font_pt=font_pt, gap_mm=gap_mm)
 
     # Clamp defensively (driver snapping the length/width a little) so
